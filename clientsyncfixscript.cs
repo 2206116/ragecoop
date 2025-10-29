@@ -1,14 +1,15 @@
 // Build this as a client resource DLL and include Harmony (HarmonyLib) in the resource package.
-// This script forces remote peds to face their travel direction while walking/running.
+// Fix: remote peds face their travel direction while walking/running (C# 7.3 compatible).
 //
-// C# 7.3 compatible.
+// Strategy:
+// 1) Patch SyncedPed.WalkTo (Prefix/Postfix) to stash the current Heading in a thread-static slot.
+// 2) Patch GTA.Native.Function.Call(Hash, params InputArgument[]) to detect TASK_GO_STRAIGHT_TO_COORD
+//    invoked during WalkTo and replace targetHeading (argument index 6) with the stashed Heading.
+// 3) Reinforce heading after WalkTo and SmoothTransition, plus a per-tick safety net.
 //
-// Fix strategy:
-// 1) Patch SyncedPed.WalkTo (Prefix/Postfix) to stash the instance's Heading in a thread-static slot.
-// 2) Patch GTA.Native.Function.Call(Hash, params InputArgument[]) (Prefix) to detect
-//    TASK_GO_STRAIGHT_TO_COORD invoked from WalkTo and replace targetHeading (arg index 6) with
-//    the stored Heading value. This prevents the “always North” bug during sprint.
-// 3) Reinforce heading each frame after movement updates as a safety net.
+// Notes:
+// - No C# 9 features used. No static class used as a type parameter.
+// - Logger.Warning overloads are respected (single string).
 
 using System;
 using System.Collections;
@@ -27,14 +28,6 @@ namespace RageCoop.Resources.SyncFix
         private Type _tSyncedPed;
         private Type _tEntityPool;
 
-        // Cached reflection members (instance)
-        private PropertyInfo _piIsLocal;
-        private PropertyInfo _piSpeed;
-        private PropertyInfo _piHeading;
-        private PropertyInfo _piMainPed;
-        private PropertyInfo _piIsAiming;
-        private FieldInfo _fiPedsByID;
-
         public override void OnStart()
         {
             try
@@ -45,32 +38,26 @@ namespace RageCoop.Resources.SyncFix
 
                 if (clientAsm == null)
                 {
-                    Logger?.Error("[SyncFix] Could not find RageCoop.Client assembly. Aborting.");
+                    if (Logger != null) Logger.Error("[SyncFix] Could not find RageCoop.Client assembly. Aborting.");
                     return;
                 }
 
                 _tSyncedPed = clientAsm.GetType("RageCoop.Client.SyncedPed", true);
                 _tEntityPool = clientAsm.GetType("RageCoop.Client.EntityPool", true);
 
-                _piIsLocal = _tSyncedPed.GetProperty("IsLocal", BindingFlags.Public | BindingFlags.Instance);
-                _piSpeed = _tSyncedPed.GetProperty("Speed", BindingFlags.Public | BindingFlags.Instance);
-                _piHeading = _tSyncedPed.GetProperty("Heading", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                _piMainPed = _tSyncedPed.GetProperty("MainPed", BindingFlags.Public | BindingFlags.Instance);
-                _piIsAiming = _tSyncedPed.GetProperty("IsAiming", BindingFlags.NonPublic | BindingFlags.Instance);
-                _fiPedsByID = _tEntityPool.GetField("PedsByID", BindingFlags.Public | BindingFlags.Static);
+                // Cache members via reflection
+                State.PI_IsLocal  = _tSyncedPed.GetProperty("IsLocal",  BindingFlags.Public | BindingFlags.Instance);
+                State.PI_Speed    = _tSyncedPed.GetProperty("Speed",    BindingFlags.Public | BindingFlags.Instance);
+                State.PI_Heading  = _tSyncedPed.GetProperty("Heading",  BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                State.PI_MainPed  = _tSyncedPed.GetProperty("MainPed",  BindingFlags.Public | BindingFlags.Instance);
+                State.PI_IsAiming = _tSyncedPed.GetProperty("IsAiming", BindingFlags.NonPublic | BindingFlags.Instance);
+                State.FI_PedsByID = _tEntityPool.GetField("PedsByID", BindingFlags.Public | BindingFlags.Static);
 
-                if (_piIsLocal == null || _piSpeed == null || _piHeading == null || _piMainPed == null || _fiPedsByID == null)
+                if (State.PI_IsLocal == null || State.PI_Speed == null || State.PI_Heading == null || State.PI_MainPed == null || State.FI_PedsByID == null)
                 {
-                    Logger?.Error("[SyncFix] Failed to bind SyncedPed/EntityPool members. Aborting.");
+                    if (Logger != null) Logger.Error("[SyncFix] Failed to bind SyncedPed/EntityPool members. Aborting.");
                     return;
                 }
-
-                // Initialize static refs used in patches
-                PatchState.PI_Speed = _piSpeed;
-                PatchState.PI_Heading = _piHeading;
-                PatchState.PI_MainPed = _piMainPed;
-                PatchState.PI_IsAiming = _piIsAiming;
-                PatchState.FI_PedsByID = _fiPedsByID;
 
                 _harmony = new Harmony("ragecoop.syncfix.heading");
 
@@ -78,35 +65,52 @@ namespace RageCoop.Resources.SyncFix
                 var miWalkTo = AccessTools.Method(_tSyncedPed, "WalkTo");
                 if (miWalkTo != null)
                 {
-                    var pre = new HarmonyMethod(typeof(WalkToScopePatch).GetMethod("Prefix", BindingFlags.Public | BindingFlags.Static));
-                    var post = new HarmonyMethod(typeof(WalkToScopePatch).GetMethod("Postfix", BindingFlags.Public | BindingFlags.Static));
-                    _harmony.Patch(miWalkTo, prefix: pre, postfix: post);
+                    _harmony.Patch(miWalkTo,
+                        prefix:  new HarmonyMethod(typeof(WalkToScopePatch).GetMethod("Prefix",  BindingFlags.Public | BindingFlags.Static)),
+                        postfix: new HarmonyMethod(typeof(WalkToScopePatch).GetMethod("Postfix", BindingFlags.Public | BindingFlags.Static)));
                 }
                 else
                 {
-                    Logger?.Warning("[SyncFix] Could not locate SyncedPed.WalkTo; heading override will rely on fallback methods.");
+                    if (Logger != null) Logger.Warning("[SyncFix] Could not locate SyncedPed.WalkTo; heading override will rely on fallback methods.");
                 }
 
-                // 2) Intercept Function.Call(Hash, params InputArgument[]) and override targetHeading during sprint
-                var miFuncCallVoid = AccessTools.Method(typeof(Function), "Call", new Type[] { typeof(Hash), typeof(InputArgument[]) });
-                if (miFuncCallVoid != null)
+                // 2) Intercept Function.Call(Hash, params InputArgument[]) and override targetHeading
+                var miCallVoid = AccessTools.Method(typeof(Function), "Call", new Type[] { typeof(Hash), typeof(InputArgument[]) });
+                if (miCallVoid != null)
                 {
-                    var pre = new HarmonyMethod(typeof(FunctionCallPatch).GetMethod("CallVoid_Prefix", BindingFlags.Public | BindingFlags.Static));
-                    _harmony.Patch(miFuncCallVoid, prefix: pre);
+                    _harmony.Patch(miCallVoid,
+                        prefix: new HarmonyMethod(typeof(FunctionCallPatch).GetMethod("CallVoid_Prefix", BindingFlags.Public | BindingFlags.Static)));
                 }
                 else
                 {
-                    Logger?.Warning("[SyncFix] Could not patch GTA.Native.Function.Call(void).");
+                    if (Logger != null) Logger.Warning("[SyncFix] Could not patch GTA.Native.Function.Call(void).");
                 }
 
-                // 3) Safety net: per-tick desired heading enforcement for all remote on-foot peds
+                // 3) Reinforce heading after updates + per-tick safety net
+                var miSmooth = AccessTools.Method(_tSyncedPed, "SmoothTransition");
+                if (miSmooth != null)
+                {
+                    _harmony.Patch(miSmooth,
+                        postfix: new HarmonyMethod(typeof(SyncedPedPatches).GetMethod("SmoothTransition_Postfix", BindingFlags.Public | BindingFlags.Static)));
+                }
+                else
+                {
+                    if (Logger != null) Logger.Warning("[SyncFix] Could not locate SyncedPed.SmoothTransition.");
+                }
+
+                if (miWalkTo != null)
+                {
+                    _harmony.Patch(miWalkTo,
+                        postfix: new HarmonyMethod(typeof(SyncedPedPatches).GetMethod("WalkTo_Postfix", BindingFlags.Public | BindingFlags.Static)));
+                }
+
                 API.Events.OnTick += OnTickEnforceHeading;
 
-                Logger?.Info("[SyncFix] Client-side heading override installed.");
+                if (Logger != null) Logger.Info("[SyncFix] Client-side heading override installed.");
             }
             catch (Exception ex)
             {
-                Logger?.Error("[SyncFix] Error during install: " + ex);
+                if (Logger != null) Logger.Error("[SyncFix] Error during install: " + ex);
             }
         }
 
@@ -118,7 +122,7 @@ namespace RageCoop.Resources.SyncFix
             }
             catch (Exception ex)
             {
-                Logger?.Warning("[SyncFix] Failed to detach tick handler: " + ex);
+                if (Logger != null) Logger.Warning("[SyncFix] Failed to detach tick handler: " + ex);
             }
 
             try
@@ -130,7 +134,7 @@ namespace RageCoop.Resources.SyncFix
             }
             catch (Exception ex)
             {
-                Logger?.Warning("[SyncFix] Failed to unpatch Harmony: " + ex);
+                if (Logger != null) Logger.Warning("[SyncFix] Failed to unpatch Harmony: " + ex);
             }
         }
 
@@ -139,33 +143,39 @@ namespace RageCoop.Resources.SyncFix
         {
             try
             {
-                var pedsDictObj = PatchState.FI_PedsByID.GetValue(null);
+                var pedsDictObj = State.FI_PedsByID.GetValue(null);
                 var pedsDict = pedsDictObj as IDictionary;
                 if (pedsDict == null || pedsDict.Count == 0) return;
 
                 foreach (DictionaryEntry kv in pedsDict)
                 {
-                    var sp = kv.Value; // SyncedPed
+                    var sp = kv.Value; // SyncedPed instance
                     if (sp == null) continue;
 
-                    object isLocalObj = PatchState.Get(_ => _.PI_IsLocal, sp, null);
+                    var isLocalObj = State.PI_IsLocal.GetValue(sp, null);
                     if (isLocalObj is bool && ((bool)isLocalObj)) continue;
 
-                    object speedObj = PatchState.Get(_ => _.PI_Speed, sp, null);
+                    var speedObj = State.PI_Speed.GetValue(sp, null);
                     if (!(speedObj is byte)) continue;
                     var speed = (byte)speedObj;
                     if (speed == 0 || speed >= 4) continue;
 
-                    var ped = PatchState.Get(_ => _.PI_MainPed, sp, null) as Ped;
+                    var ped = State.PI_MainPed.GetValue(sp, null) as Ped;
                     if (ped == null || !ped.Exists()) continue;
 
-                    // Avoid forcing heading while aiming (let strafe look direction be natural)
                     bool isAiming = false;
-                    var aimObj = PatchState.Get(_ => _.PI_IsAiming, sp, null);
-                    if (aimObj is bool) isAiming = (bool)aimObj;
+                    if (State.PI_IsAiming != null)
+                    {
+                        try
+                        {
+                            var aimObj = State.PI_IsAiming.GetValue(sp, null);
+                            if (aimObj is bool) isAiming = (bool)aimObj;
+                        }
+                        catch { }
+                    }
                     if (isAiming) continue;
 
-                    object headingObj = PatchState.Get(_ => _.PI_Heading, sp, null);
+                    var headingObj = State.PI_Heading.GetValue(sp, null);
                     if (!(headingObj is float)) continue;
                     var heading = (float)headingObj;
 
@@ -178,35 +188,18 @@ namespace RageCoop.Resources.SyncFix
             }
         }
 
-        // Static state holders used by patches
-        internal static class PatchState
+        // Shared state and cached reflection info (C# 7.3-safe).
+        internal static class State
         {
-            // Shared member references
+            public static PropertyInfo PI_IsLocal;
             public static PropertyInfo PI_Speed;
             public static PropertyInfo PI_Heading;
             public static PropertyInfo PI_MainPed;
-            public static PropertyInfo PI_IsLocal; // will be fetched per-instance in safety net via direct
             public static PropertyInfo PI_IsAiming;
-            public static FieldInfo FI_PedsByID;
+            public static FieldInfo    FI_PedsByID;
 
-            [ThreadStatic] public static bool TLS_InWalkTo;
+            [ThreadStatic] public static bool  TLS_InWalkTo;
             [ThreadStatic] public static float TLS_DesiredHeading;
-
-            // Helper to safely get a property value via a selector on this class fields
-            public static object Get(Func<PatchState, PropertyInfo> sel, object instance, object defaultValue)
-            {
-                PropertyInfo pi = sel(PatchStateAccessor.Instance);
-                try
-                {
-                    return pi != null ? pi.GetValue(instance, null) : defaultValue;
-                }
-                catch { return defaultValue; }
-            }
-
-            private class PatchStateAccessor : PatchState
-            {
-                public static readonly PatchState Instance = new PatchState();
-            }
         }
 
         // Enter/leave WalkTo: stash per-instance Heading into thread-static so Function.Call patch can use it
@@ -216,53 +209,52 @@ namespace RageCoop.Resources.SyncFix
             {
                 try
                 {
-                    object headingObj = PatchState.PI_Heading != null ? PatchState.PI_Heading.GetValue(__instance, null) : null;
+                    var headingObj = State.PI_Heading != null ? State.PI_Heading.GetValue(__instance, null) : null;
                     if (headingObj is float)
                     {
-                        PatchState.TLS_DesiredHeading = (float)headingObj;
-                        PatchState.TLS_InWalkTo = true;
+                        State.TLS_DesiredHeading = (float)headingObj;
+                        State.TLS_InWalkTo = true;
                     }
                     else
                     {
-                        PatchState.TLS_InWalkTo = false;
+                        State.TLS_InWalkTo = false;
                     }
                 }
                 catch
                 {
-                    PatchState.TLS_InWalkTo = false;
+                    State.TLS_InWalkTo = false;
                 }
             }
 
             public static void Postfix()
             {
-                PatchState.TLS_InWalkTo = false;
+                State.TLS_InWalkTo = false;
             }
         }
 
-        // Intercept Function.Call for TASK_GO_STRAIGHT_TO_COORD and override targetHeading (arg[6]) when inside WalkTo
+        // Intercept Function.Call for TASK_GO_STRAIGHT_TO_COORD and override targetHeading (args[6]) when inside WalkTo
         public static class FunctionCallPatch
         {
-            public static void CallVoid_Prefix(ref Hash hash, ref InputArgument[] arguments)
+            public static void CallVoid_Prefix(Hash hash, InputArgument[] arguments)
             {
                 try
                 {
-                    if (!PatchState.TLS_InWalkTo) return;
+                    if (!State.TLS_InWalkTo) return;
                     if (hash != Hash.TASK_GO_STRAIGHT_TO_COORD) return;
                     if (arguments == null || arguments.Length < 8) return;
 
-                    // Replace targetHeading = arguments[6] with the stashed desired heading
-                    float desired = PatchState.TLS_DesiredHeading;
-                    arguments[6] = new InputArgument(desired);
+                    // TASK_GO_STRAIGHT_TO_COORD(ped, x, y, z, speed, timeout, targetHeading, distanceToSlide)
+                    arguments[6] = new InputArgument(State.TLS_DesiredHeading);
                 }
                 catch
                 {
-                    // Do nothing if we fail; safer to let original call proceed
+                    // No-op on failure
                 }
             }
         }
     }
 
-    // Extra patches to reinforce heading after movement — left public for Harmony visibility and C# 7.3 compat
+    // Extra patches to reinforce heading after movement — public for Harmony visibility, C# 7.3 compatible
     public static class SyncedPedPatches
     {
         private static PropertyInfo PI_Speed, PI_Heading, PI_MainPed, PI_IsAiming;
@@ -271,9 +263,9 @@ namespace RageCoop.Resources.SyncFix
         {
             if (PI_Speed != null) return;
             var tSyncedPed = instance.GetType();
-            PI_Speed = tSyncedPed.GetProperty("Speed", BindingFlags.Public | BindingFlags.Instance);
-            PI_Heading = tSyncedPed.GetProperty("Heading", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-            PI_MainPed = tSyncedPed.GetProperty("MainPed", BindingFlags.Public | BindingFlags.Instance);
+            PI_Speed    = tSyncedPed.GetProperty("Speed",    BindingFlags.Public | BindingFlags.Instance);
+            PI_Heading  = tSyncedPed.GetProperty("Heading",  BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            PI_MainPed  = tSyncedPed.GetProperty("MainPed",  BindingFlags.Public | BindingFlags.Instance);
             PI_IsAiming = tSyncedPed.GetProperty("IsAiming", BindingFlags.NonPublic | BindingFlags.Instance);
         }
 
@@ -284,7 +276,7 @@ namespace RageCoop.Resources.SyncFix
             {
                 EnsureBind(__instance);
 
-                object speedObj = PI_Speed != null ? PI_Speed.GetValue(__instance, null) : null;
+                var speedObj = PI_Speed != null ? PI_Speed.GetValue(__instance, null) : null;
                 if (!(speedObj is byte)) return;
                 var speed = (byte)speedObj;
                 if (speed == 0 || speed >= 4) return;
@@ -304,7 +296,7 @@ namespace RageCoop.Resources.SyncFix
                 }
                 if (isAiming) return;
 
-                object headingObj = PI_Heading != null ? PI_Heading.GetValue(__instance, null) : null;
+                var headingObj = PI_Heading != null ? PI_Heading.GetValue(__instance, null) : null;
                 if (!(headingObj is float)) return;
                 var heading = (float)headingObj;
 
@@ -320,7 +312,7 @@ namespace RageCoop.Resources.SyncFix
             {
                 EnsureBind(__instance);
 
-                object speedObj = PI_Speed != null ? PI_Speed.GetValue(__instance, null) : null;
+                var speedObj = PI_Speed != null ? PI_Speed.GetValue(__instance, null) : null;
                 if (!(speedObj is byte)) return;
                 var speed = (byte)speedObj;
                 if (speed == 0 || speed >= 4) return;
@@ -340,7 +332,7 @@ namespace RageCoop.Resources.SyncFix
                 }
                 if (isAiming) return;
 
-                object headingObj = PI_Heading != null ? PI_Heading.GetValue(__instance, null) : null;
+                var headingObj = PI_Heading != null ? PI_Heading.GetValue(__instance, null) : null;
                 if (!(headingObj is float)) return;
                 var heading = (float)headingObj;
 
