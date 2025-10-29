@@ -1,0 +1,7 @@
+C:\Users\JMK\Desktop\RAGECOOP-V-1.5.4.7\bin\Release\Client\RageCoop.Client.dll
+C:\Users\JMK\Desktop\RAGECOOP-V-1.5.4.7\RageCoop.Client\obj\Release\RageCoop.Client.csproj.AssemblyReference.cache
+C:\Users\JMK\Desktop\RAGECOOP-V-1.5.4.7\RageCoop.Client\obj\Release\RageCoop.Client.csproj.CoreCompileInputs.cache
+C:\Users\JMK\Desktop\RAGECOOP-V-1.5.4.7\RageCoop.Client\obj\Release\RageCoop.Client.csproj.Fody.CopyLocal.cache
+C:\Users\JMK\Desktop\RAGECOOP-V-1.5.4.7\RageCoop.Client\obj\Release\RageCoop.Client.csproj.Fody.RuntimeCopyLocal.cache
+C:\Users\JMK\Desktop\RAGECOOP-V-1.5.4.7\RageCoop.Client\obj\Release\RageCoop.19699DBC.Up2Date
+C:\Users\JMK\Desktop\RAGECOOP-V-1.5.4.7\RageCoop.Client\obj\Release\RageCoop.Client.dll
