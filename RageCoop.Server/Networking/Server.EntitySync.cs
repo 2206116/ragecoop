@@ -8,7 +8,7 @@ namespace RageCoop.Server
 {
     public partial class Server
     {
-        // Track last known on-foot speed and heading per ped (kept for future use)
+        // Track last known on-foot speed and heading per ped
         private readonly Dictionary<int, byte> _lastFootSpeed = new();
         private readonly Dictionary<int, float> _lastMoveHeading = new();
         private readonly Dictionary<int, long> _lastMoveHintAt = new();
@@ -16,14 +16,24 @@ namespace RageCoop.Server
         // Last time we observed movement for a ped (used for speed hysteresis)
         private readonly Dictionary<int, long> _lastFootMovingAt = new();
 
+        // Track last known position per ped to recover heading when velocity is tiny
+        private readonly Dictionary<int, GTA.Math.Vector3> _lastPos = new();
+
         private static float HorizontalSpeed(GTA.Math.Vector3 v)
             => (float)Math.Sqrt(v.X * v.X + v.Y * v.Y);
 
-        private static float HeadingFromVelocity(GTA.Math.Vector3 v)
+        private static float HeadingFromVector(GTA.Math.Vector3 v)
         {
+            // GTA heading: 0° = North (+Y), 90° = East (+X), 180° = South (-Y), 270° = West (-X)
             var deg = (float)(Math.Atan2(v.X, v.Y) * (180.0 / Math.PI));
             if (deg < 0) deg += 360f;
             return deg;
+        }
+
+        private static float HeadingFromDelta(GTA.Math.Vector3 from, GTA.Math.Vector3 to)
+        {
+            var d = new GTA.Math.Vector3(to.X - from.X, to.Y - from.Y, 0f);
+            return HeadingFromVector(d);
         }
 
         // Trust client’s reported walk/run/sprint; only force stop when nearly stationary
@@ -31,7 +41,7 @@ namespace RageCoop.Server
         private static byte NormalizeFootSpeed(byte reported, GTA.Math.Vector3 velocity, PedDataFlags flags)
         {
             if (reported >= 4) return reported; // vehicle states
-            if (HorizontalSpeed(velocity) < 0.005f) return 0;
+            if (HorizontalSpeed(velocity) < 0.005f) return 0; // very close to still
             return reported;
         }
 
@@ -60,7 +70,7 @@ namespace RageCoop.Server
             var hsp = HorizontalSpeed(packet.Velocity);
 
             // Hysteresis: keep last non-zero speed briefly when instantaneous velocity dips during a turn
-            bool consideredMoving = (packet.Speed > 0) || (hsp > 0.03f);
+            bool consideredMoving = (packet.Speed > 0) || (hsp > 0.01f);
             if (consideredMoving)
             {
                 _lastFootMovingAt[packet.ID] = now;
@@ -77,17 +87,54 @@ namespace RageCoop.Server
             }
 
             // Movement state
-            bool onFootMoving = packet.Speed > 0 && packet.Speed < 4 && hsp > 0.1f;
+            bool onFoot = packet.Speed > 0 && packet.Speed < 4;
 
-            // Force heading from motion when moving and not aiming so remote peds face travel direction.
-            if (onFootMoving && !packet.Flags.HasPedFlag(PedDataFlags.IsAiming))
+            // Force heading from motion when on foot and not aiming.
+            if (onFoot && !packet.Flags.HasPedFlag(PedDataFlags.IsAiming))
             {
-                packet.Heading = HeadingFromVelocity(packet.Velocity);
+                float heading;
+                if (hsp > 0.0025f)
+                {
+                    // Prefer velocity-derived heading when it has signal
+                    heading = HeadingFromVector(packet.Velocity);
+                }
+                else
+                {
+                    // Fall back to position delta since some clients may send near-zero velocity while still moving
+                    if (_lastPos.TryGetValue(packet.ID, out var lastP))
+                    {
+                        var deltaXY = HorizontalSpeed(new GTA.Math.Vector3(packet.Position.X - lastP.X, packet.Position.Y - lastP.Y, 0f));
+                        if (deltaXY > 0.001f)
+                        {
+                            heading = HeadingFromDelta(lastP, packet.Position);
+                        }
+                        else
+                        {
+                            // If no usable delta, keep previous heading if we have it
+                            if (!_lastMoveHeading.TryGetValue(packet.ID, out heading))
+                            {
+                                heading = packet.Heading; // fallback to what client sent
+                            }
+                        }
+                    }
+                    else
+                    {
+                        heading = packet.Heading; // first sample, no delta yet
+                    }
+                }
+
+                // Normalize 0..360 and apply
+                if (heading < 0) heading += 360f;
+                if (heading >= 360f) heading -= 360f;
+                packet.Heading = heading;
             }
 
+            // Persist state for next tick
             _lastFootSpeed[packet.ID] = packet.Speed;
+            _lastPos[packet.ID] = packet.Position;
 
-            if (onFootMoving)
+            // Save heading for delta smoothing next tick
+            if (onFoot)
             {
                 _lastMoveHeading[packet.ID] = packet.Heading;
             }
@@ -96,6 +143,7 @@ namespace RageCoop.Server
                 _lastMoveHeading.Remove(packet.ID);
             }
 
+            // Broadcast with streaming checks
             foreach (var c in ClientsByNetHandle.Values)
             {
                 if (c.NetHandle == client.NetHandle) { continue; }
