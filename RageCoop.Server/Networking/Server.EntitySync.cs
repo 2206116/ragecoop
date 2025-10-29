@@ -8,7 +8,7 @@ namespace RageCoop.Server
 {
     public partial class Server
     {
-        // Track last known on-foot speed and heading per ped
+        // Track last known on-foot speed and heading per ped (kept for future use)
         private readonly Dictionary<int, byte> _lastFootSpeed = new();
         private readonly Dictionary<int, float> _lastMoveHeading = new();
         private readonly Dictionary<int, long> _lastMoveHintAt = new();
@@ -143,7 +143,6 @@ namespace RageCoop.Server
                 _lastMoveHeading.Remove(packet.ID);
             }
 
-            // Broadcast with streaming checks
             foreach (var c in ClientsByNetHandle.Values)
             {
                 if (c.NetHandle == client.NetHandle) { continue; }
