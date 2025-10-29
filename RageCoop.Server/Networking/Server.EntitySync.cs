@@ -82,11 +82,41 @@ namespace RageCoop.Server
             // Movement state
             bool onFootMoving = packet.Speed > 0 && packet.Speed < 4 && hsp > 0.1f;
 
-            // Do NOT override heading here; let clients/Harmony patch derive facing from motion
+            // Force heading from motion when moving (and not aiming) so remote peds face their travel direction,
+            // which prevents the sideways "lean" during turns.
+            if (onFootMoving && !packet.Flags.HasPedFlag(PedDataFlags.IsAiming))
+            {
+                var motionHeading = HeadingFromVelocity(packet.Velocity);
+
+                // Optional: small server-side damping to avoid micro jitter between packets.
+                if (_lastMoveHeading.TryGetValue(packet.ID, out var lastHead))
+                {
+                    var delta = AngleDelta(motionHeading, lastHead);
+                    if (delta > 2f)
+                    {
+                        // Nudge toward motion heading; client will still smooth further.
+                        var step = Math.Min(delta, 15f);
+                        // Determine shortest direction toward motionHeading
+                        float dir = ((motionHeading - lastHead + 540f) % 360f) - 180f; // range [-180, 180]
+                        packet.Heading = (lastHead + Math.Sign(dir) * step + 360f) % 360f;
+                    }
+                    else
+                    {
+                        packet.Heading = motionHeading;
+                    }
+                }
+                else
+                {
+                    packet.Heading = motionHeading;
+                }
+            }
+            // Else: do NOT override heading; let clients/Harmony patch derive facing from motion/aim
+
             _lastFootSpeed[packet.ID] = packet.Speed;
 
             if (onFootMoving)
             {
+                // Store the heading we just decided to broadcast
                 _lastMoveHeading[packet.ID] = packet.Heading;
             }
             else
@@ -117,7 +147,7 @@ namespace RageCoop.Server
             QueueJob(() => Entities.Update(packet, client));
             bool isPlayer = packet.ID == client.Player?.LastVehicle?.ID;
 
-            foreach (var c in ClientsByNetHandle.Values)
+        foreach (var c in ClientsByNetHandle.Values)
             {
                 if (c.NetHandle == client.NetHandle) { continue; }
                 if (isPlayer)
