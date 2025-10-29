@@ -8,7 +8,8 @@
 // 3) Reinforce heading after WalkTo and SmoothTransition, plus a per-tick safety net.
 //
 // Notes:
-// - No C# 9 features used. No static class used as a type parameter.
+// - Avoids C# 9 features and AccessTools.Method to prevent AmbiguousMatchException.
+// - Uses reflection filters (by name + param count/types) to select exact overloads.
 // - Logger.Warning overloads are respected (single string).
 
 using System;
@@ -62,12 +63,16 @@ namespace RageCoop.Resources.SyncFix
                 _harmony = new Harmony("ragecoop.syncfix.heading");
 
                 // 1) WalkTo scope (Prefix/Postfix) to capture desired heading in thread-static
-                var miWalkTo = AccessTools.Method(_tSyncedPed, "WalkTo");
+                var miWalkTo = FindInstanceMethodNoArgs(_tSyncedPed, "WalkTo");
                 if (miWalkTo != null)
                 {
                     _harmony.Patch(miWalkTo,
                         prefix:  new HarmonyMethod(typeof(WalkToScopePatch).GetMethod("Prefix",  BindingFlags.Public | BindingFlags.Static)),
                         postfix: new HarmonyMethod(typeof(WalkToScopePatch).GetMethod("Postfix", BindingFlags.Public | BindingFlags.Static)));
+
+                    // Also reinforce after WalkTo completes
+                    _harmony.Patch(miWalkTo,
+                        postfix: new HarmonyMethod(typeof(SyncedPedPatches).GetMethod("WalkTo_Postfix", BindingFlags.Public | BindingFlags.Static)));
                 }
                 else
                 {
@@ -75,7 +80,7 @@ namespace RageCoop.Resources.SyncFix
                 }
 
                 // 2) Intercept Function.Call(Hash, params InputArgument[]) and override targetHeading
-                var miCallVoid = AccessTools.Method(typeof(Function), "Call", new Type[] { typeof(Hash), typeof(InputArgument[]) });
+                var miCallVoid = FindFunctionCallVoid();
                 if (miCallVoid != null)
                 {
                     _harmony.Patch(miCallVoid,
@@ -86,8 +91,15 @@ namespace RageCoop.Resources.SyncFix
                     if (Logger != null) Logger.Warning("[SyncFix] Could not patch GTA.Native.Function.Call(void).");
                 }
 
-                // 3) Reinforce heading after updates + per-tick safety net
-                var miSmooth = AccessTools.Method(_tSyncedPed, "SmoothTransition");
+                var miCallGeneric = FindFunctionCallGeneric();
+                if (miCallGeneric != null)
+                {
+                    _harmony.Patch(miCallGeneric,
+                        prefix: new HarmonyMethod(typeof(FunctionCallPatch).GetMethod("CallVoid_Prefix", BindingFlags.Public | BindingFlags.Static)));
+                }
+
+                // 3) Reinforce heading after updates
+                var miSmooth = FindInstanceMethodNoArgs(_tSyncedPed, "SmoothTransition");
                 if (miSmooth != null)
                 {
                     _harmony.Patch(miSmooth,
@@ -98,12 +110,7 @@ namespace RageCoop.Resources.SyncFix
                     if (Logger != null) Logger.Warning("[SyncFix] Could not locate SyncedPed.SmoothTransition.");
                 }
 
-                if (miWalkTo != null)
-                {
-                    _harmony.Patch(miWalkTo,
-                        postfix: new HarmonyMethod(typeof(SyncedPedPatches).GetMethod("WalkTo_Postfix", BindingFlags.Public | BindingFlags.Static)));
-                }
-
+                // Safety net: per-tick enforcement
                 API.Events.OnTick += OnTickEnforceHeading;
 
                 if (Logger != null) Logger.Info("[SyncFix] Client-side heading override installed.");
@@ -186,6 +193,48 @@ namespace RageCoop.Resources.SyncFix
             {
                 // Silent; runs every frame
             }
+        }
+
+        // Helper: find instance method with no parameters (public or non-public)
+        private static MethodInfo FindInstanceMethodNoArgs(Type t, string name)
+        {
+            return t.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                    .FirstOrDefault(m => m.Name == name && m.GetParameters().Length == 0);
+        }
+
+        // Helper: find GTA.Native.Function.Call(Hash, InputArgument[]) (void)
+        private static MethodInfo FindFunctionCallVoid()
+        {
+            var methods = typeof(Function).GetMethods(BindingFlags.Public | BindingFlags.Static);
+            foreach (var m in methods)
+            {
+                if (m.Name != "Call") continue;
+                if (m.IsGenericMethodDefinition) continue;
+                var ps = m.GetParameters();
+                if (ps.Length != 2) continue;
+                if (ps[0].ParameterType != typeof(Hash)) continue;
+                if (ps[1].ParameterType != typeof(InputArgument[])) continue;
+                if (m.ReturnType != typeof(void)) continue;
+                return m;
+            }
+            return null;
+        }
+
+        // Helper: find GTA.Native.Function.Call<T>(Hash, InputArgument[]) (generic definition)
+        private static MethodInfo FindFunctionCallGeneric()
+        {
+            var methods = typeof(Function).GetMethods(BindingFlags.Public | BindingFlags.Static);
+            foreach (var m in methods)
+            {
+                if (m.Name != "Call") continue;
+                if (!m.IsGenericMethodDefinition) continue;
+                var ps = m.GetParameters();
+                if (ps.Length != 2) continue;
+                if (ps[0].ParameterType != typeof(Hash)) continue;
+                if (ps[1].ParameterType != typeof(InputArgument[])) continue;
+                return m;
+            }
+            return null;
         }
 
         // Shared state and cached reflection info (C# 7.3-safe).
