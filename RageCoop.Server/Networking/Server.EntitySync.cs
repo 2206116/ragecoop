@@ -1,4 +1,4 @@
-﻿using Lidgren.Network;
+using Lidgren.Network;
 using RageCoop.Core;
 using RageCoop.Server.Scripting;
 using System;
@@ -13,6 +13,9 @@ namespace RageCoop.Server
         private readonly Dictionary<int, float> _lastMoveHeading = new();
         private readonly Dictionary<int, long> _lastMoveHintAt = new();
 
+        // NEW: last time we observed movement for a ped (used for speed hysteresis)
+        private readonly Dictionary<int, long> _lastFootMovingAt = new();
+
         private static float HorizontalSpeed(GTA.Math.Vector3 v)
             => (float)Math.Sqrt(v.X * v.X + v.Y * v.Y);
 
@@ -24,11 +27,12 @@ namespace RageCoop.Server
         }
 
         // Trust client’s reported walk/run/sprint; only force stop when nearly stationary
+        // Loosen the threshold so turns don’t get treated as a stop.
         private static byte NormalizeFootSpeed(byte reported, GTA.Math.Vector3 velocity, PedDataFlags flags)
         {
             if (reported >= 4) return reported; // vehicle states
-                                                // Lower threshold so we don't prematurely force stop during deceleration
-            if (HorizontalSpeed(velocity) < 0.03f) return 0;
+            // Lower threshold further to avoid zeroing speed during sharp turns
+            if (HorizontalSpeed(velocity) < 0.005f) return 0;
             return reported;
         }
 
@@ -53,11 +57,32 @@ namespace RageCoop.Server
             // Normalize speed conservatively
             packet.Speed = NormalizeFootSpeed(packet.Speed, packet.Velocity, packet.Flags);
 
+            // Hysteresis: keep last non-zero speed briefly when instantaneous velocity dips during a turn
+            var now = Environment.TickCount64;
+            var hsp = HorizontalSpeed(packet.Velocity);
+
+            // Consider "moving" if server thinks speed > 0 OR velocity still reasonably high
+            bool consideredMoving = (packet.Speed > 0) || (hsp > 0.03f);
+            if (consideredMoving)
+            {
+                _lastFootMovingAt[packet.ID] = now;
+            }
+            else
+            {
+                // Within grace window? Keep the previous non-zero speed to avoid animation/task thrash
+                if (_lastFootMovingAt.TryGetValue(packet.ID, out var lastMoveTs) && (now - lastMoveTs) < 200)
+                {
+                    if (_lastFootSpeed.TryGetValue(packet.ID, out var prevSpeed) && prevSpeed > 0)
+                    {
+                        packet.Speed = prevSpeed;
+                    }
+                }
+            }
+
             // Movement state
-            bool onFootMoving = packet.Speed > 0 && packet.Speed < 4 && HorizontalSpeed(packet.Velocity) > 0.1f;
+            bool onFootMoving = packet.Speed > 0 && packet.Speed < 4 && hsp > 0.1f;
 
             // Do NOT override heading here; let clients/Harmony patch derive facing from motion
-
             _lastFootSpeed[packet.ID] = packet.Speed;
 
             if (onFootMoving)
