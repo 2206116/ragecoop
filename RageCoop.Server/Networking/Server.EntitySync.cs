@@ -13,7 +13,7 @@ namespace RageCoop.Server
         private readonly Dictionary<int, float> _lastMoveHeading = new();
         private readonly Dictionary<int, long> _lastMoveHintAt = new();
 
-        // NEW: last time we observed movement for a ped (used for speed hysteresis)
+        // Last time we observed movement for a ped (used for speed hysteresis)
         private readonly Dictionary<int, long> _lastFootMovingAt = new();
 
         private static float HorizontalSpeed(GTA.Math.Vector3 v)
@@ -27,11 +27,10 @@ namespace RageCoop.Server
         }
 
         // Trust client’s reported walk/run/sprint; only force stop when nearly stationary
-        // Loosen the threshold so turns don’t get treated as a stop.
+        // Loosened threshold so quick turns don’t get treated as a stop.
         private static byte NormalizeFootSpeed(byte reported, GTA.Math.Vector3 velocity, PedDataFlags flags)
         {
             if (reported >= 4) return reported; // vehicle states
-            // Lower threshold further to avoid zeroing speed during sharp turns
             if (HorizontalSpeed(velocity) < 0.005f) return 0;
             return reported;
         }
@@ -54,14 +53,13 @@ namespace RageCoop.Server
                 QueueJob(() => API.Events.InvokePlayerUpdate(client));
             }
 
-            // Normalize speed conservatively
+            // Normalize speed conservatively (with hysteresis)
             packet.Speed = NormalizeFootSpeed(packet.Speed, packet.Velocity, packet.Flags);
 
-            // Hysteresis: keep last non-zero speed briefly when instantaneous velocity dips during a turn
             var now = Environment.TickCount64;
             var hsp = HorizontalSpeed(packet.Velocity);
 
-            // Consider "moving" if server thinks speed > 0 OR velocity still reasonably high
+            // Hysteresis: keep last non-zero speed briefly when instantaneous velocity dips during a turn
             bool consideredMoving = (packet.Speed > 0) || (hsp > 0.03f);
             if (consideredMoving)
             {
@@ -69,7 +67,6 @@ namespace RageCoop.Server
             }
             else
             {
-                // Within grace window? Keep the previous non-zero speed to avoid animation/task thrash
                 if (_lastFootMovingAt.TryGetValue(packet.ID, out var lastMoveTs) && (now - lastMoveTs) < 200)
                 {
                     if (_lastFootSpeed.TryGetValue(packet.ID, out var prevSpeed) && prevSpeed > 0)
@@ -82,41 +79,16 @@ namespace RageCoop.Server
             // Movement state
             bool onFootMoving = packet.Speed > 0 && packet.Speed < 4 && hsp > 0.1f;
 
-            // Force heading from motion when moving (and not aiming) so remote peds face their travel direction,
-            // which prevents the sideways "lean" during turns.
+            // Force heading from motion when moving and not aiming so remote peds face travel direction.
             if (onFootMoving && !packet.Flags.HasPedFlag(PedDataFlags.IsAiming))
             {
-                var motionHeading = HeadingFromVelocity(packet.Velocity);
-
-                // Optional: small server-side damping to avoid micro jitter between packets.
-                if (_lastMoveHeading.TryGetValue(packet.ID, out var lastHead))
-                {
-                    var delta = AngleDelta(motionHeading, lastHead);
-                    if (delta > 2f)
-                    {
-                        // Nudge toward motion heading; client will still smooth further.
-                        var step = Math.Min(delta, 15f);
-                        // Determine shortest direction toward motionHeading
-                        float dir = ((motionHeading - lastHead + 540f) % 360f) - 180f; // range [-180, 180]
-                        packet.Heading = (lastHead + Math.Sign(dir) * step + 360f) % 360f;
-                    }
-                    else
-                    {
-                        packet.Heading = motionHeading;
-                    }
-                }
-                else
-                {
-                    packet.Heading = motionHeading;
-                }
+                packet.Heading = HeadingFromVelocity(packet.Velocity);
             }
-            // Else: do NOT override heading; let clients/Harmony patch derive facing from motion/aim
 
             _lastFootSpeed[packet.ID] = packet.Speed;
 
             if (onFootMoving)
             {
-                // Store the heading we just decided to broadcast
                 _lastMoveHeading[packet.ID] = packet.Heading;
             }
             else
@@ -147,7 +119,7 @@ namespace RageCoop.Server
             QueueJob(() => Entities.Update(packet, client));
             bool isPlayer = packet.ID == client.Player?.LastVehicle?.ID;
 
-        foreach (var c in ClientsByNetHandle.Values)
+            foreach (var c in ClientsByNetHandle.Values)
             {
                 if (c.NetHandle == client.NetHandle) { continue; }
                 if (isPlayer)
