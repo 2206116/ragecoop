@@ -66,6 +66,13 @@ namespace RageCoop.Server
             // Normalize speed conservatively (with hysteresis)
             packet.Speed = NormalizeFootSpeed(packet.Speed, packet.Velocity, packet.Flags);
 
+            // Add in PedSync after packet.Speed normalized and before broadcasting:
+            if (packet.Speed == 3)
+            {
+                // Map sprint to run to avoid TASK_GO_STRAIGHT_TO_COORD heading=0 on clients
+                packet.Speed = 2;
+            }
+
             var now = Environment.TickCount64;
             var hsp = HorizontalSpeed(packet.Velocity);
 
