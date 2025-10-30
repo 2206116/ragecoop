@@ -1,21 +1,19 @@
 // Build this as a client resource DLL and include Harmony (HarmonyLib) in the resource package.
 //
-// Hard client-side fix for "faces North":
-// - Completely avoids the sprint code path (which hard-codes targetHeading=0.0) by converting Speed=3 to Speed=2
-//   in two places:
-//   1) On receive (Networking.PedSync): coerce incoming packet Speed from 3->2 before the ped updates.
-//   2) In SyncedPed.WalkTo: if Speed is 3, flip it to 2 right before the switch so the RunTo branch executes.
-// - Also ensures SyncedPed.Heading is set from packet or derived from motion (velocity/delta) on receive.
+// Hard fix: fully override SyncedPed.WalkTo for on-foot states (Speed 1..3) so all native movement
+// tasks use the current server-sent Heading instead of letting the original sprint branch pass 0.0f.
+// We call TASK_GO_STRAIGHT_TO_COORD for walk/run/sprint with the correct heading parameter, and
+// then immediately force ped.Heading to that value. We also invoke SmoothTransition to preserve
+// original smoothing behavior.
 //
-// C# 7.3 compatible. No patching of generic Function.Call<T>. No TaskType/ReadPosition usage.
+// C# 7.3 compatible. No Function.Call<T> generic patches. No TaskType/ReadPosition usage.
 
 using System;
-using System.Collections;
-using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using GTA;
 using GTA.Math;
+using GTA.Native;
 using HarmonyLib;
 using RageCoop.Client.Scripting;
 
@@ -24,109 +22,62 @@ namespace RageCoop.Resources.ClientPatch
     public class ClientHeadingPatch : ClientScript
     {
         private Harmony _harmony;
-
-        // Types
         private Type _tSyncedPed;
-        private Type _tNetworking;
-        private Type _tEntityPool;
-        private Type _tPackets;
-        private Type _tPedSync;
 
-        // SyncedPed members
-        internal static PropertyInfo PI_IsLocal;
+        // Reflection cache for SyncedPed
         internal static PropertyInfo PI_Speed;
         internal static PropertyInfo PI_Heading;
         internal static PropertyInfo PI_MainPed;
-
-        // EntityPool access
-        internal static MethodInfo MI_GetPedByID;
-
-        // Packets.PedSync members
-        internal static PropertyInfo PK_ID;
-        internal static PropertyInfo PK_Position;
-        internal static PropertyInfo PK_Velocity;
-        internal static PropertyInfo PK_Speed;
-        internal static PropertyInfo PK_Heading;
+        internal static PropertyInfo PI_Position;
+        internal static PropertyInfo PI_Velocity;
+        internal static MethodInfo   MI_Predict;
+        internal static MethodInfo   MI_SmoothTransition;
 
         public override void OnStart()
         {
             try
             {
-                var asms = AppDomain.CurrentDomain.GetAssemblies();
-                var clientAsm = asms.FirstOrDefault(a => string.Equals(a.GetName().Name, "RageCoop.Client", StringComparison.OrdinalIgnoreCase));
-                var coreAsm   = asms.FirstOrDefault(a => string.Equals(a.GetName().Name, "RageCoop.Core", StringComparison.OrdinalIgnoreCase));
-                if (clientAsm == null || coreAsm == null)
+                var clientAsm = AppDomain.CurrentDomain
+                    .GetAssemblies()
+                    .FirstOrDefault(a => string.Equals(a.GetName().Name, "RageCoop.Client", StringComparison.OrdinalIgnoreCase));
+
+                if (clientAsm == null)
                 {
-                    Logger?.Error("[ClientPatch] Required assemblies not found (RageCoop.Client/Core).");
+                    Logger?.Error("[ClientPatch] RageCoop.Client assembly not found.");
                     return;
                 }
 
-                _tSyncedPed  = clientAsm.GetType("RageCoop.Client.SyncedPed", true);
-                _tNetworking = clientAsm.GetType("RageCoop.Client.Networking", true);
-                _tEntityPool = clientAsm.GetType("RageCoop.Client.EntityPool", true);
+                _tSyncedPed = clientAsm.GetType("RageCoop.Client.SyncedPed", true);
 
-                _tPackets = coreAsm.GetType("RageCoop.Core.Packets", true);
-                _tPedSync = _tPackets.GetNestedType("PedSync", BindingFlags.NonPublic | BindingFlags.Public);
+                // Bind members
+                PI_Speed           = _tSyncedPed.GetProperty("Speed",   BindingFlags.Public | BindingFlags.Instance);
+                PI_Heading         = _tSyncedPed.GetProperty("Heading", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                PI_MainPed         = _tSyncedPed.GetProperty("MainPed", BindingFlags.Public | BindingFlags.Instance);
+                PI_Position        = _tSyncedPed.GetProperty("Position",BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                PI_Velocity        = _tSyncedPed.GetProperty("Velocity",BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                MI_Predict         = _tSyncedPed.GetMethod("Predict", BindingFlags.NonPublic | BindingFlags.Instance, null, new Type[] { typeof(Vector3) }, null);
+                MI_SmoothTransition= _tSyncedPed.GetMethod("SmoothTransition", BindingFlags.NonPublic | BindingFlags.Instance);
 
-                // Bind SyncedPed members
-                PI_IsLocal  = _tSyncedPed.GetProperty("IsLocal",  BindingFlags.Public | BindingFlags.Instance);
-                PI_Speed    = _tSyncedPed.GetProperty("Speed",    BindingFlags.Public | BindingFlags.Instance);
-                PI_Heading  = _tSyncedPed.GetProperty("Heading",  BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                PI_MainPed  = _tSyncedPed.GetProperty("MainPed",  BindingFlags.Public | BindingFlags.Instance);
-                if (PI_IsLocal == null || PI_Speed == null || PI_Heading == null || PI_MainPed == null)
+                if (PI_Speed == null || PI_Heading == null || PI_MainPed == null ||
+                    PI_Position == null || PI_Velocity == null || MI_Predict == null || MI_SmoothTransition == null)
                 {
-                    Logger?.Error("[ClientPatch] Failed to bind SyncedPed members.");
+                    Logger?.Error("[ClientPatch] Failed to bind SyncedPed members (Speed/Heading/MainPed/Position/Velocity/Predict/SmoothTransition).");
                     return;
                 }
 
-                // EntityPool.GetPedByID(int)
-                MI_GetPedByID = _tEntityPool.GetMethod("GetPedByID", BindingFlags.Public | BindingFlags.Static, null, new Type[] { typeof(int) }, null);
-
-                // Packet members
-                PK_ID       = _tPedSync.GetProperty("ID",        BindingFlags.Public | BindingFlags.Instance);
-                PK_Position = _tPedSync.GetProperty("Position",  BindingFlags.Public | BindingFlags.Instance);
-                PK_Velocity = _tPedSync.GetProperty("Velocity",  BindingFlags.Public | BindingFlags.Instance);
-                PK_Speed    = _tPedSync.GetProperty("Speed",     BindingFlags.Public | BindingFlags.Instance);
-                PK_Heading  = _tPedSync.GetProperty("Heading",   BindingFlags.Public | BindingFlags.Instance);
-
-                if (MI_GetPedByID == null || PK_ID == null || PK_Position == null || PK_Velocity == null || PK_Speed == null || PK_Heading == null)
-                {
-                    Logger?.Error("[ClientPatch] Failed to bind PedSync/EntityPool members.");
-                    return;
-                }
-
-                _harmony = new Harmony("ragecoop.clientpatch.force-run-and-heading");
-
-                // 1) Patch Networking.PedSync(Packets.PedSync) to coerce Speed and set Heading
-                var miNetPedSync = _tNetworking.GetMethods(BindingFlags.NonPublic | BindingFlags.Static)
-                                              .FirstOrDefault(m =>
-                                              {
-                                                  if (m.Name != "PedSync") return false;
-                                                  var p = m.GetParameters();
-                                                  return p.Length == 1 && p[0].ParameterType == _tPedSync;
-                                              });
-                if (miNetPedSync != null)
-                {
-                    _harmony.Patch(miNetPedSync, postfix: new HarmonyMethod(typeof(ReceivePedSyncPostfix).GetMethod("Postfix", BindingFlags.Public | BindingFlags.Static)));
-                }
-                else
-                {
-                    Logger?.Warning("[ClientPatch] Networking.PedSync not found; receive coercion not applied.");
-                }
-
-                // 2) Patch SyncedPed.WalkTo() to flip Speed=3->2 just before the switch
+                _harmony = new Harmony("ragecoop.clientpatch.walkto.override.all");
                 var miWalkTo = _tSyncedPed.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
                                           .FirstOrDefault(m => m.Name == "WalkTo" && m.GetParameters().Length == 0);
-                if (miWalkTo != null)
+                if (miWalkTo == null)
                 {
-                    _harmony.Patch(miWalkTo, prefix: new HarmonyMethod(typeof(WalkToForceRunPrefix).GetMethod("Prefix", BindingFlags.Public | BindingFlags.Static)));
-                }
-                else
-                {
-                    Logger?.Warning("[ClientPatch] SyncedPed.WalkTo not found; run coercion not applied.");
+                    Logger?.Error("[ClientPatch] Could not locate SyncedPed.WalkTo.");
+                    return;
                 }
 
-                Logger?.Info("[ClientPatch] Installed: Receive Speed/Heading coercion + WalkTo run-forcing prefix.");
+                _harmony.Patch(miWalkTo,
+                    prefix: new HarmonyMethod(typeof(WalkToOverrideAll).GetMethod("Prefix", BindingFlags.Public | BindingFlags.Static)));
+
+                Logger?.Info("[ClientPatch] Installed: Full WalkTo override for on-foot (uses correct heading).");
             }
             catch (Exception ex)
             {
@@ -140,7 +91,7 @@ namespace RageCoop.Resources.ClientPatch
             {
                 if (_harmony != null)
                 {
-                    _harmony.UnpatchAll("ragecoop.clientpatch.force-run-and-heading");
+                    _harmony.UnpatchAll("ragecoop.clientpatch.walkto.override.all");
                 }
             }
             catch (Exception ex)
@@ -149,105 +100,106 @@ namespace RageCoop.Resources.ClientPatch
             }
         }
 
-        // Postfix: after the client processes a PedSync, enforce Heading and flip Sprint->Run for remote peds
-        public static class ReceivePedSyncPostfix
+        public static class WalkToOverrideAll
         {
-            private static readonly Dictionary<int, Vector3> _lastPos = new Dictionary<int, Vector3>();
-
-            public static void Postfix(object packet)
+            public static bool Prefix(object __instance)
             {
                 try
                 {
-                    if (packet == null) return;
+                    // Read ped and state
+                    var ped = ClientHeadingPatch.PI_MainPed.GetValue(__instance, null) as Ped;
+                    if (ped == null || !ped.Exists()) return true; // fallback to original
 
-                    int id = 0;
+                    var speedObj = ClientHeadingPatch.PI_Speed.GetValue(__instance, null);
+                    if (!(speedObj is byte)) return true;
+                    var speed = (byte)speedObj;
+
+                    // Only override on-foot (1..3). Let original handle vehicles/others.
+                    if (speed == 0 || speed >= 4) return true;
+
+                    // Compute predictPosition = Predict(Position) + Velocity
                     Vector3 pos = default(Vector3);
                     Vector3 vel = default(Vector3);
-                    byte speed = 0;
-                    float pktHeading = 0f;
+                    try { var p = ClientHeadingPatch.PI_Position.GetValue(__instance, null); if (p is Vector3) pos = (Vector3)p; } catch { }
+                    try { var v = ClientHeadingPatch.PI_Velocity.GetValue(__instance, null); if (v is Vector3) vel = (Vector3)v; } catch { }
 
-                    try { id = (int)ClientHeadingPatch.PK_ID.GetValue(packet, null); } catch { }
-                    try { pos = (Vector3)ClientHeadingPatch.PK_Position.GetValue(packet, null); } catch { }
-                    try { vel = (Vector3)ClientHeadingPatch.PK_Velocity.GetValue(packet, null); } catch { }
-                    try { speed = (byte)ClientHeadingPatch.PK_Speed.GetValue(packet, null); } catch { }
-                    try { pktHeading = (float)ClientHeadingPatch.PK_Heading.GetValue(packet, null); } catch { }
+                    Vector3 predict = pos;
+                    try { predict = (Vector3)ClientHeadingPatch.MI_Predict.Invoke(__instance, new object[] { pos }); } catch { }
+                    Vector3 predictPosition = predict + vel;
 
-                    // Resolve SyncedPed
-                    var sp = ClientHeadingPatch.MI_GetPedByID.Invoke(null, new object[] { id });
-                    if (sp == null) { _lastPos[id] = pos; return; }
-
-                    // Flip sprint to run for all remote peds so client never enters the sprint branch
+                    // Desired heading (server-sent)
+                    float heading = ped.Heading;
                     try
                     {
-                        var isLocalObj = ClientHeadingPatch.PI_IsLocal.GetValue(sp, null);
-                        bool isLocal = (isLocalObj is bool) && (bool)isLocalObj;
-                        if (!isLocal && speed == 3)
-                        {
-                            ClientHeadingPatch.PI_Speed.SetValue(sp, (byte)2, null);
-                        }
+                        var h = ClientHeadingPatch.PI_Heading.GetValue(__instance, null);
+                        if (h is float) heading = (float)h;
                     }
                     catch { }
 
-                    // Ensure Heading is non-zero and reflects motion if packet provided 0
-                    float useHeading = pktHeading;
-                    float hsp = (float)Math.Sqrt(vel.X * vel.X + vel.Y * vel.Y);
-                    if (useHeading == 0f)
+                    // Thresholds roughly match original behavior (using ped.Position instead of ReadPosition)
+                    Vector3 cur = ped.Position;
+                    float dx = predictPosition.X - cur.X;
+                    float dy = predictPosition.Y - cur.Y;
+                    float dz = predictPosition.Z - cur.Z;
+                    float rangeSq = dx * dx + dy * dy + dz * dz;
+
+                    // Execute movement with correct heading for all on-foot speeds
+                    switch (speed)
                     {
-                        if (hsp > 0.0025f)
-                        {
-                            useHeading = HeadingFromVec(vel);
-                        }
-                        else
-                        {
-                            Vector3 last;
-                            if (_lastPos.TryGetValue(id, out last))
+                        case 1:
+                            // Walk: small threshold, slow move. Use GO_STRAIGHT_TO_COORD so we can pass heading.
+                            if (!ped.IsWalking || rangeSq > 0.25f)
                             {
-                                var dx = pos.X - last.X;
-                                var dy = pos.Y - last.Y;
-                                var dxy = (float)Math.Sqrt(dx * dx + dy * dy);
-                                if (dxy > 0.001f) useHeading = HeadingFromVec(new Vector3(dx, dy, 0f));
+                                float moveSpeed = 1.0f;
+                                Function.Call(Hash.TASK_GO_STRAIGHT_TO_COORD, ped.Handle,
+                                              predictPosition.X, predictPosition.Y, predictPosition.Z,
+                                              moveSpeed, -1, heading, 0.0f);
+
+                                // Blend ratio roughly follows original nrange
+                                float nrange = rangeSq * 2f;
+                                if (nrange > 1.0f) nrange = 1.0f;
+                                Function.Call(Hash.SET_PED_DESIRED_MOVE_BLEND_RATIO, ped.Handle, nrange);
                             }
-                        }
+                            break;
+
+                        case 2:
+                            // Run: medium threshold
+                            if (!ped.IsRunning || rangeSq > 0.50f)
+                            {
+                                float moveSpeed = 2.0f;
+                                Function.Call(Hash.TASK_GO_STRAIGHT_TO_COORD, ped.Handle,
+                                              predictPosition.X, predictPosition.Y, predictPosition.Z,
+                                              moveSpeed, -1, heading, 0.0f);
+                                Function.Call(Hash.SET_PED_DESIRED_MOVE_BLEND_RATIO, ped.Handle, 1.0f);
+                            }
+                            break;
+
+                        case 3:
+                            // Sprint: original forced 0.0f heading; we pass the correct heading here
+                            if (!ped.IsSprinting || rangeSq > 0.75f)
+                            {
+                                Function.Call(Hash.TASK_GO_STRAIGHT_TO_COORD, ped.Handle,
+                                              predictPosition.X, predictPosition.Y, predictPosition.Z,
+                                              3.0f, -1, heading, 0.0f);
+                                Function.Call(Hash.SET_RUN_SPRINT_MULTIPLIER_FOR_PLAYER, ped.Handle, 1.49f);
+                                Function.Call(Hash.SET_PED_DESIRED_MOVE_BLEND_RATIO, ped.Handle, 1.0f);
+                            }
+                            break;
                     }
-                    if (useHeading < 0f) useHeading += 360f;
-                    if (useHeading >= 360f) useHeading -= 360f;
 
-                    try { ClientHeadingPatch.PI_Heading.SetValue(sp, useHeading, null); } catch { }
+                    // Hard-enforce facing immediately (AI may ignore desired heading while moving)
+                    ped.Heading = heading;
 
-                    _lastPos[id] = pos;
+                    // Keep original smoothing behavior
+                    try { ClientHeadingPatch.MI_SmoothTransition.Invoke(__instance, null); } catch { }
+
+                    // Skip original WalkTo entirely (we handled all on-foot branches)
+                    return false;
                 }
                 catch
                 {
-                    // swallow
-                }
-            }
-
-            private static float HeadingFromVec(Vector3 v)
-            {
-                // GTA: 0=N(+Y), 90=E(+X)
-                var deg = (float)(Math.Atan2(v.X, v.Y) * (180.0 / Math.PI));
-                return deg < 0 ? deg + 360f : deg;
-            }
-        }
-
-        // Prefix: right before SyncedPed.WalkTo’s switch(Speed), force Speed=2 when Speed==3
-        public static class WalkToForceRunPrefix
-        {
-            public static void Prefix(object __instance)
-            {
-                try
-                {
-                    var speedObj = ClientHeadingPatch.PI_Speed.GetValue(__instance, null);
-                    if (!(speedObj is byte)) return;
-                    var speed = (byte)speedObj;
-                    if (speed == 3)
-                    {
-                        ClientHeadingPatch.PI_Speed.SetValue(__instance, (byte)2, null);
-                    }
-                }
-                catch
-                {
-                    // ignore
+                    // If anything fails, let original execute
+                    return true;
                 }
             }
         }
