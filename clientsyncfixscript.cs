@@ -2,15 +2,15 @@
 // Fix: remote peds face their travel direction while walking/running (C# 7.3 compatible).
 //
 // Strategy:
-// - Harmony Prefix on SyncedPed.WalkTo: completely override the original to call the same native tasks
-//   but pass the server-sent Heading for sprint/run (so it won't lock to North).
-// - Call SmoothTransition at the end (like the original).
-// - Postfix on SmoothTransition and a per-tick safety net to reinforce heading for on-foot, non-aiming peds.
+// - Harmony Prefix on SyncedPed.WalkTo: fully override the original to issue the same movement tasks
+//   but pass the server-sent Heading for run/sprint (fixes "face North").
+// - Postfix on SmoothTransition: reinforce heading for on-foot, non-aiming peds.
+// - Per-tick safety net: apply SET_PED_DESIRED_HEADING for remote on-foot, non-aiming peds.
 //
 // Notes:
-// - No patching of GTA.Native.Function.Call<T> (avoids MonoMod NotSupported).
-// - No C# 9 features. Uses reflection to read SyncedPed internals (Heading/Position/Velocity/etc).
-// - If you still see North, confirm this Prefix is applied (you should see the install log).
+// - Avoids Ped.ReadPosition, TaskType, and IsTaskActive (not available to resource scripts).
+// - No patching of generic Function.Call<T> (avoids MonoMod NotSupported).
+// - C# 7.3 compatible.
 
 using System;
 using System.Collections;
@@ -53,7 +53,7 @@ namespace RageCoop.Resources.SyncFix
 
                 if (clientAsm == null)
                 {
-                    if (Logger != null) Logger.Error("[SyncFix] Could not find RageCoop.Client assembly. Aborting.");
+                    Logger?.Error("[SyncFix] Could not find RageCoop.Client assembly. Aborting.");
                     return;
                 }
 
@@ -76,7 +76,7 @@ namespace RageCoop.Resources.SyncFix
                 if (PI_IsLocal == null || PI_Speed == null || PI_Heading == null || PI_MainPed == null ||
                     PI_Position == null || PI_Velocity == null || FI_PedsByID == null || MI_SmoothTransition == null)
                 {
-                    if (Logger != null) Logger.Error("[SyncFix] Failed to bind SyncedPed/EntityPool members. Aborting.");
+                    Logger?.Error("[SyncFix] Failed to bind SyncedPed/EntityPool members. Aborting.");
                     return;
                 }
 
@@ -91,7 +91,7 @@ namespace RageCoop.Resources.SyncFix
                 }
                 else
                 {
-                    if (Logger != null) Logger.Warning("[SyncFix] Could not locate SyncedPed.WalkTo; this patch cannot apply.");
+                    Logger?.Warning("[SyncFix] Could not locate SyncedPed.WalkTo; this patch cannot apply.");
                 }
 
                 // Reinforce after SmoothTransition
@@ -105,17 +105,17 @@ namespace RageCoop.Resources.SyncFix
                 // Per-tick safety net
                 API.Events.OnTick += OnTickEnforceHeading;
 
-                if (Logger != null) Logger.Info("[SyncFix] Installed WalkTo override + heading reinforcement.");
+                Logger?.Info("[SyncFix] Installed WalkTo override + heading reinforcement (no ReadPosition/TaskType usage).");
             }
             catch (Exception ex)
             {
-                if (Logger != null) Logger.Error("[SyncFix] Error during install: " + ex);
+                Logger?.Error("[SyncFix] Error during install: " + ex);
             }
         }
 
         public override void OnStop()
         {
-            try { API.Events.OnTick -= OnTickEnforceHeading; } catch (Exception ex) { if (Logger != null) Logger.Warning("[SyncFix] Failed to detach tick handler: " + ex); }
+            try { API.Events.OnTick -= OnTickEnforceHeading; } catch (Exception ex) { Logger?.Warning("[SyncFix] Failed to detach tick handler: " + ex); }
 
             try
             {
@@ -126,7 +126,7 @@ namespace RageCoop.Resources.SyncFix
             }
             catch (Exception ex)
             {
-                if (Logger != null) Logger.Warning("[SyncFix] Failed to unpatch Harmony: " + ex);
+                Logger?.Warning("[SyncFix] Failed to unpatch Harmony: " + ex);
             }
         }
 
@@ -184,7 +184,7 @@ namespace RageCoop.Resources.SyncFix
         }
     }
 
-    // Prefix override for SyncedPed.WalkTo
+    // Prefix override for SyncedPed.WalkTo (no Ped.ReadPosition or TaskType calls)
     public static class WalkToOverridePatch
     {
         public static bool Prefix(object __instance)
@@ -236,8 +236,8 @@ namespace RageCoop.Resources.SyncFix
 
                 Vector3 predictPosition = predict + vel;
 
-                // Distance squared between predicted and current
-                Vector3 cur = ped.ReadPosition();
+                // Distance squared between predicted and current (use Ped.Position, not ReadPosition)
+                Vector3 cur = ped.Position;
                 float dx = predictPosition.X - cur.X;
                 float dy = predictPosition.Y - cur.Y;
                 float dz = predictPosition.Z - cur.Z;
@@ -310,9 +310,8 @@ namespace RageCoop.Resources.SyncFix
                         break;
 
                     default:
-                        // Original code stands still and clears certain tasks. Keep it minimal.
+                        // Minimal idle handling without TaskType
                         ped.Task.StandStill(200);
-                        if (ped.IsTaskActive(TaskType.CTaskDiveToGround)) ped.Task.ClearAll();
                         break;
                 }
 
