@@ -2,25 +2,22 @@
 // Fix: remote peds face their travel direction while walking/running (C# 7.3 compatible).
 //
 // Strategy:
-// - Robust Harmony Transpiler on SyncedPed.WalkTo that rewrites the InputArgument[] element at index 6
-//   (targetHeading for TASK_GO_STRAIGHT_TO_COORD) to use this.Heading, regardless of how the float is loaded
-//   (ldc.r4, ldc.i4.0+conv.r4, etc.) or how the params array is built.
-// - Postfix on SmoothTransition to reinforce heading for on-foot, non-aiming peds.
-// - Per-tick safety net to apply SET_PED_DESIRED_HEADING for on-foot, non-aiming peds.
+// - Harmony Prefix on SyncedPed.WalkTo: completely override the original to call the same native tasks
+//   but pass the server-sent Heading for sprint/run (so it won't lock to North).
+// - Call SmoothTransition at the end (like the original).
+// - Postfix on SmoothTransition and a per-tick safety net to reinforce heading for on-foot, non-aiming peds.
 //
 // Notes:
-// - We do NOT patch any generic methods (avoids MonoMod NotSupportedExceptions).
-// - C# 7.3 compatible.
-// - After install you should see a log "WalkTo index-6 replacements: N" (N >= 1).
-//   If N=0, please paste your log and we’ll widen the matcher again.
+// - No patching of GTA.Native.Function.Call<T> (avoids MonoMod NotSupported).
+// - No C# 9 features. Uses reflection to read SyncedPed internals (Heading/Position/Velocity/etc).
+// - If you still see North, confirm this Prefix is applied (you should see the install log).
 
 using System;
 using System.Collections;
-using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
-using System.Reflection.Emit;
 using GTA;
+using GTA.Math;
 using GTA.Native;
 using HarmonyLib;
 using RageCoop.Client.Scripting;
@@ -33,9 +30,18 @@ namespace RageCoop.Resources.SyncFix
         private Type _tSyncedPed;
         private Type _tEntityPool;
 
-        // Reflection cache for the safety net
-        private static PropertyInfo PI_IsLocal, PI_Speed, PI_Heading, PI_MainPed, PI_IsAiming;
-        private static FieldInfo FI_PedsByID;
+        // Reflection cache
+        internal static PropertyInfo PI_IsLocal;
+        internal static PropertyInfo PI_Speed;
+        internal static PropertyInfo PI_Heading;
+        internal static PropertyInfo PI_MainPed;
+        internal static PropertyInfo PI_IsAiming;
+        internal static PropertyInfo PI_IsInStealthMode;
+        internal static PropertyInfo PI_Position;
+        internal static PropertyInfo PI_Velocity;
+        internal static MethodInfo   MI_Predict;
+        internal static MethodInfo   MI_SmoothTransition;
+        internal static FieldInfo    FI_PedsByID;
 
         public override void OnStart()
         {
@@ -54,54 +60,52 @@ namespace RageCoop.Resources.SyncFix
                 _tSyncedPed = clientAsm.GetType("RageCoop.Client.SyncedPed", true);
                 _tEntityPool = clientAsm.GetType("RageCoop.Client.EntityPool", true);
 
-                // Bind properties/fields used by safety net
-                PI_IsLocal  = _tSyncedPed.GetProperty("IsLocal",  BindingFlags.Public | BindingFlags.Instance);
-                PI_Speed    = _tSyncedPed.GetProperty("Speed",    BindingFlags.Public | BindingFlags.Instance);
-                PI_Heading  = _tSyncedPed.GetProperty("Heading",  BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                PI_MainPed  = _tSyncedPed.GetProperty("MainPed",  BindingFlags.Public | BindingFlags.Instance);
-                PI_IsAiming = _tSyncedPed.GetProperty("IsAiming", BindingFlags.NonPublic | BindingFlags.Instance);
-                FI_PedsByID = _tEntityPool.GetField("PedsByID", BindingFlags.Public | BindingFlags.Static);
+                // Bind members we'll need
+                PI_IsLocal         = _tSyncedPed.GetProperty("IsLocal",         BindingFlags.Public | BindingFlags.Instance);
+                PI_Speed           = _tSyncedPed.GetProperty("Speed",           BindingFlags.Public | BindingFlags.Instance);
+                PI_Heading         = _tSyncedPed.GetProperty("Heading",         BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                PI_MainPed         = _tSyncedPed.GetProperty("MainPed",         BindingFlags.Public | BindingFlags.Instance);
+                PI_IsAiming        = _tSyncedPed.GetProperty("IsAiming",        BindingFlags.NonPublic | BindingFlags.Instance);
+                PI_IsInStealthMode = _tSyncedPed.GetProperty("IsInStealthMode", BindingFlags.NonPublic | BindingFlags.Instance);
+                PI_Position        = _tSyncedPed.GetProperty("Position",        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                PI_Velocity        = _tSyncedPed.GetProperty("Velocity",        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                MI_Predict         = _tSyncedPed.GetMethod("Predict", BindingFlags.NonPublic | BindingFlags.Instance, null, new Type[] { typeof(Vector3) }, null);
+                MI_SmoothTransition= _tSyncedPed.GetMethod("SmoothTransition", BindingFlags.NonPublic | BindingFlags.Instance);
+                FI_PedsByID        = _tEntityPool.GetField("PedsByID", BindingFlags.Public | BindingFlags.Static);
 
-                if (PI_IsLocal == null || PI_Speed == null || PI_Heading == null || PI_MainPed == null || FI_PedsByID == null)
+                if (PI_IsLocal == null || PI_Speed == null || PI_Heading == null || PI_MainPed == null ||
+                    PI_Position == null || PI_Velocity == null || FI_PedsByID == null || MI_SmoothTransition == null)
                 {
                     if (Logger != null) Logger.Error("[SyncFix] Failed to bind SyncedPed/EntityPool members. Aborting.");
                     return;
                 }
 
-                _harmony = new Harmony("ragecoop.syncfix.walkto.heading");
+                _harmony = new Harmony("ragecoop.syncfix.walkto.override");
 
-                // Transpile SyncedPed.WalkTo (instance, no args)
+                // Override WalkTo entirely (instance, no args). Prefix returns false to skip original.
                 var miWalkTo = FindInstanceMethodNoArgs(_tSyncedPed, "WalkTo");
                 if (miWalkTo != null)
                 {
-                    var transpiler = new HarmonyMethod(typeof(WalkToHeadingTranspiler).GetMethod("Transpiler", BindingFlags.Public | BindingFlags.Static));
-                    _harmony.Patch(miWalkTo, transpiler: transpiler);
+                    _harmony.Patch(miWalkTo,
+                        prefix: new HarmonyMethod(typeof(WalkToOverridePatch).GetMethod("Prefix", BindingFlags.Public | BindingFlags.Static)));
                 }
                 else
                 {
-                    if (Logger != null) Logger.Warning("[SyncFix] Could not locate SyncedPed.WalkTo; heading will rely on reinforcement.");
+                    if (Logger != null) Logger.Warning("[SyncFix] Could not locate SyncedPed.WalkTo; this patch cannot apply.");
                 }
 
                 // Reinforce after SmoothTransition
                 var miSmooth = FindInstanceMethodNoArgs(_tSyncedPed, "SmoothTransition");
                 if (miSmooth != null)
                 {
-                    _harmony.Patch(miSmooth, postfix: new HarmonyMethod(typeof(SmoothReinforcePatch).GetMethod("Postfix", BindingFlags.Public | BindingFlags.Static)));
-                }
-                else
-                {
-                    if (Logger != null) Logger.Warning("[SyncFix] Could not locate SyncedPed.SmoothTransition.");
+                    _harmony.Patch(miSmooth,
+                        postfix: new HarmonyMethod(typeof(SmoothReinforcePatch).GetMethod("Postfix", BindingFlags.Public | BindingFlags.Static)));
                 }
 
                 // Per-tick safety net
                 API.Events.OnTick += OnTickEnforceHeading;
 
-                if (Logger != null)
-                {
-                    Logger.Info("[SyncFix] Installed. WalkTo index-6 replacements: " + WalkToHeadingTranspiler.ReplacementCount);
-                    if (WalkToHeadingTranspiler.ReplacementCount == 0)
-                        Logger.Warning("[SyncFix] No index-6 heading element was replaced in WalkTo. Share this log and we’ll tailor the matcher.");
-                }
+                if (Logger != null) Logger.Info("[SyncFix] Installed WalkTo override + heading reinforcement.");
             }
             catch (Exception ex)
             {
@@ -111,17 +115,13 @@ namespace RageCoop.Resources.SyncFix
 
         public override void OnStop()
         {
-            try { API.Events.OnTick -= OnTickEnforceHeading; }
-            catch (Exception ex)
-            {
-                if (Logger != null) Logger.Warning("[SyncFix] Failed to detach tick handler: " + ex);
-            }
+            try { API.Events.OnTick -= OnTickEnforceHeading; } catch (Exception ex) { if (Logger != null) Logger.Warning("[SyncFix] Failed to detach tick handler: " + ex); }
 
             try
             {
                 if (_harmony != null)
                 {
-                    _harmony.UnpatchAll("ragecoop.syncfix.walkto.heading");
+                    _harmony.UnpatchAll("ragecoop.syncfix.walkto.override");
                 }
             }
             catch (Exception ex)
@@ -130,16 +130,16 @@ namespace RageCoop.Resources.SyncFix
             }
         }
 
-        // Per-tick safety: ensure remote on-foot, non-aiming peds desire the server heading
+        // Per-tick safety: enforce desired heading for remote, on-foot, non-aiming peds
         private void OnTickEnforceHeading()
         {
             try
             {
                 var pedsDictObj = FI_PedsByID.GetValue(null);
-                var pedsDict = pedsDictObj as IDictionary;
+                var pedsDict = pedsDictObj as System.Collections.IDictionary;
                 if (pedsDict == null || pedsDict.Count == 0) return;
 
-                foreach (DictionaryEntry kv in pedsDict)
+                foreach (System.Collections.DictionaryEntry kv in pedsDict)
                 {
                     var sp = kv.Value; // SyncedPed instance
                     if (sp == null) continue;
@@ -184,114 +184,149 @@ namespace RageCoop.Resources.SyncFix
         }
     }
 
-    // Robust Transpiler:
-    // We scan the array initialization sequence for InputArgument[] in WalkTo and look for
-    //   dup; ldc.i4.s 6; ... ; newobj InputArgument::.ctor(float32); stelem.ref
-    // When we detect index==6, we replace the value-producing sequence just before newobj
-    // with: ldarg.0 ; callvirt instance float32 get_Heading()
-    public static class WalkToHeadingTranspiler
+    // Prefix override for SyncedPed.WalkTo
+    public static class WalkToOverridePatch
     {
-        public static int ReplacementCount = 0;
-
-        public static IEnumerable<CodeInstruction> Transpiler(MethodBase original, IEnumerable<CodeInstruction> instructions, ILGenerator il)
+        public static bool Prefix(object __instance)
         {
-            var codes = new List<CodeInstruction>(instructions);
-            var ctorFloat = typeof(InputArgument).GetConstructor(new Type[] { typeof(float) });
-
-            // Resolve get_Heading on the declaring type of WalkTo
-            MethodInfo getHeading = null;
-            var declType = original.DeclaringType;
-            if (declType != null)
+            try
             {
-                var prop = declType.GetProperty("Heading", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                if (prop != null) getHeading = prop.GetGetMethod(true);
-            }
+                // Read required state via reflection
+                var ped = Main.PI_MainPed.GetValue(__instance, null) as Ped;
+                if (ped == null || !ped.Exists()) return true; // fall back to original if something's off
 
-            if (getHeading == null || ctorFloat == null)
-            {
-                // Nothing we can do
-                return codes;
-            }
+                // Clear tasks as original does
+                ped.Task.ClearAll();
 
-            for (int i = 0; i < codes.Count - 5; i++)
-            {
-                // Pattern: dup ; ldc.i4.* 6 ; <any number of instructions that push a float> ; newobj InputArgument(float) ; stelem.ref
-                if (codes[i].opcode == OpCodes.Dup &&
-                    IsLoadConstI4WithValue(codes[i + 1], 6))
+                // Set stealth movement flag
+                bool stealth = false;
+                if (Main.PI_IsInStealthMode != null)
                 {
-                    // Find the next 'newobj InputArgument(float)'
-                    int j = i + 2;
-                    int newObjIndex = -1;
-                    for (; j < Math.Min(i + 25, codes.Count); j++)
+                    try
                     {
-                        if (codes[j].opcode == OpCodes.Newobj && codes[j].operand is ConstructorInfo && (ConstructorInfo)codes[j].operand == ctorFloat)
-                        {
-                            newObjIndex = j;
-                            break;
-                        }
+                        var stealthObj = Main.PI_IsInStealthMode.GetValue(__instance, null);
+                        if (stealthObj is bool) stealth = (bool)stealthObj;
                     }
-                    if (newObjIndex == -1) continue;
-
-                    // We expect stelem.ref right after
-                    int k = newObjIndex + 1;
-                    if (k >= codes.Count) continue;
-                    bool hasStelem = (codes[k].opcode == OpCodes.Stelem_Ref || codes[k].opcode == OpCodes.Stelem);
-                    if (!hasStelem) continue;
-
-                    // Replace whatever value-producing sequence exists between (i+2 .. newObjIndex-1)
-                    // with: ldarg.0 ; callvirt get_Heading
-                    // Implementation: remove those slots and inject our two instructions at i+2
-                    // Ensure we don't break label/branch targets: insert first, then NOP the old value-producing range.
-
-                    // Insert ldarg.0; callvirt get_Heading before newobj
-                    codes.Insert(newObjIndex, new CodeInstruction(OpCodes.Callvirt, getHeading));
-                    codes.Insert(newObjIndex, new CodeInstruction(OpCodes.Ldarg_0));
-
-                    // NOP previous value-producing segment
-                    for (int p = i + 2; p < newObjIndex; p++)
-                    {
-                        // Only clear simple constants and math; avoid wrecking labels
-                        if (codes[p].labels != null && codes[p].labels.Count > 0) continue;
-                        if (codes[p].opcode.FlowControl == FlowControl.Next)
-                        {
-                            codes[p].opcode = OpCodes.Nop;
-                            codes[p].operand = null;
-                        }
-                    }
-
-                    ReplacementCount++;
-                    // Advance past the edited segment
-                    i = newObjIndex + 1;
+                    catch { }
                 }
-            }
+                Function.Call(Hash.SET_PED_STEALTH_MOVEMENT, ped, stealth, 0);
 
-            return codes;
-        }
-
-        private static bool IsLoadConstI4WithValue(CodeInstruction ci, int value)
-        {
-            if (ci.opcode == OpCodes.Ldc_I4 && ci.operand is int && (int)ci.operand == value) return true;
-            if (value == 6 && (ci.opcode == OpCodes.Ldc_I4_6)) return true;
-            if (value >= -1 && value <= 8)
-            {
-                // Handle short forms
-                switch (value)
+                // Compute predictPosition = Predict(Position) + Velocity
+                Vector3 pos = default(Vector3);
+                Vector3 vel = default(Vector3);
+                try
                 {
-                    case -1: return ci.opcode == OpCodes.Ldc_I4_M1;
-                    case 0: return ci.opcode == OpCodes.Ldc_I4_0;
-                    case 1: return ci.opcode == OpCodes.Ldc_I4_1;
-                    case 2: return ci.opcode == OpCodes.Ldc_I4_2;
-                    case 3: return ci.opcode == OpCodes.Ldc_I4_3;
-                    case 4: return ci.opcode == OpCodes.Ldc_I4_4;
-                    case 5: return ci.opcode == OpCodes.Ldc_I4_5;
-                    case 6: return ci.opcode == OpCodes.Ldc_I4_6;
-                    case 7: return ci.opcode == OpCodes.Ldc_I4_7;
-                    case 8: return ci.opcode == OpCodes.Ldc_I4_8;
+                    var posObj = Main.PI_Position.GetValue(__instance, null);
+                    if (posObj is Vector3) pos = (Vector3)posObj;
                 }
+                catch { }
+                try
+                {
+                    var velObj = Main.PI_Velocity.GetValue(__instance, null);
+                    if (velObj is Vector3) vel = (Vector3)velObj;
+                }
+                catch { }
+
+                Vector3 predict = pos;
+                try
+                {
+                    if (Main.MI_Predict != null) predict = (Vector3)Main.MI_Predict.Invoke(__instance, new object[] { pos });
+                }
+                catch { }
+
+                Vector3 predictPosition = predict + vel;
+
+                // Distance squared between predicted and current
+                Vector3 cur = ped.ReadPosition();
+                float dx = predictPosition.X - cur.X;
+                float dy = predictPosition.Y - cur.Y;
+                float dz = predictPosition.Z - cur.Z;
+                float range = dx * dx + dy * dy + dz * dz;
+
+                // Read speed and heading
+                var speedObj = Main.PI_Speed.GetValue(__instance, null);
+                if (!(speedObj is byte)) return true; // fallback
+                byte speed = (byte)speedObj;
+
+                var headingObj = Main.PI_Heading.GetValue(__instance, null);
+                float heading = (headingObj is float) ? (float)headingObj : ped.Heading;
+
+                // Aiming?
+                bool isAiming = false;
+                if (Main.PI_IsAiming != null)
+                {
+                    try
+                    {
+                        var aimObj = Main.PI_IsAiming.GetValue(__instance, null);
+                        if (aimObj is bool) isAiming = (bool)aimObj;
+                    }
+                    catch { }
+                }
+
+                // Recreate original behavior but fix heading for run/sprint
+                switch (speed)
+                {
+                    case 1:
+                        if (!ped.IsWalking || range > 0.25f)
+                        {
+                            float nrange = range * 2f;
+                            if (nrange > 1.0f) nrange = 1.0f;
+
+                            ped.Task.GoStraightTo(predictPosition);
+                            Function.Call(Hash.SET_PED_DESIRED_MOVE_BLEND_RATIO, ped.Handle, nrange);
+                        }
+                        break;
+
+                    case 2:
+                        if (!ped.IsRunning || range > 0.50f)
+                        {
+                            ped.Task.RunTo(predictPosition, true);
+                            Function.Call(Hash.SET_PED_DESIRED_MOVE_BLEND_RATIO, ped.Handle, 1.0f);
+
+                            // Reinforce facing while running (not aiming)
+                            if (!isAiming)
+                            {
+                                Function.Call(Hash.SET_PED_DESIRED_HEADING, ped.Handle, heading);
+                            }
+                        }
+                        break;
+
+                    case 3:
+                        if (!ped.IsSprinting || range > 0.75f)
+                        {
+                            // IMPORTANT: pass server-sent heading here (fixes North lock)
+                            Function.Call(Hash.TASK_GO_STRAIGHT_TO_COORD, ped.Handle,
+                                predictPosition.X, predictPosition.Y, predictPosition.Z,
+                                3.0f, -1, heading, 0.0f);
+
+                            Function.Call(Hash.SET_RUN_SPRINT_MULTIPLIER_FOR_PLAYER, ped.Handle, 1.49f);
+                            Function.Call(Hash.SET_PED_DESIRED_MOVE_BLEND_RATIO, ped.Handle, 1.0f);
+
+                            if (!isAiming)
+                            {
+                                Function.Call(Hash.SET_PED_DESIRED_HEADING, ped.Handle, heading);
+                            }
+                        }
+                        break;
+
+                    default:
+                        // Original code stands still and clears certain tasks. Keep it minimal.
+                        ped.Task.StandStill(200);
+                        if (ped.IsTaskActive(TaskType.CTaskDiveToGround)) ped.Task.ClearAll();
+                        break;
+                }
+
+                // Call SmoothTransition like the original did, to keep positional smoothing
+                try { Main.MI_SmoothTransition.Invoke(__instance, null); } catch { }
+
+                // Skip original WalkTo
+                return false;
             }
-            // Also handle ldc.i4.s
-            if (ci.opcode == OpCodes.Ldc_I4_S && ci.operand is sbyte && (sbyte)ci.operand == (sbyte)value) return true;
-            return false;
+            catch
+            {
+                // In case anything fails, let the original run
+                return true;
+            }
         }
     }
 
@@ -316,12 +351,12 @@ namespace RageCoop.Resources.SyncFix
             {
                 Ensure(__instance);
 
-                var speedObj = PI_Speed != null ? PI_Speed.GetValue(__instance, null) : null;
+                var speedObj = PI_Speed.GetValue(__instance, null);
                 if (!(speedObj is byte)) return;
                 var speed = (byte)speedObj;
                 if (speed == 0 || speed >= 4) return;
 
-                var ped = PI_MainPed != null ? PI_MainPed.GetValue(__instance, null) as Ped : null;
+                var ped = PI_MainPed.GetValue(__instance, null) as Ped;
                 if (ped == null || !ped.Exists()) return;
 
                 bool isAiming = false;
@@ -336,7 +371,7 @@ namespace RageCoop.Resources.SyncFix
                 }
                 if (isAiming) return;
 
-                var headingObj = PI_Heading != null ? PI_Heading.GetValue(__instance, null) : null;
+                var headingObj = PI_Heading.GetValue(__instance, null);
                 if (!(headingObj is float)) return;
                 var heading = (float)headingObj;
 
