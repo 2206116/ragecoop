@@ -1,16 +1,17 @@
 // Build this as a client resource DLL and include Harmony (HarmonyLib) in the resource package.
-// Fix: remote peds face their travel direction while walking/running (C# 7.3 compatible).
+// Force remote peds to face their travel direction while walking/running (C# 7.3 compatible).
 //
-// Strategy:
-// - Harmony Prefix on SyncedPed.WalkTo: fully override the original to issue the same movement tasks
-//   but pass the server-sent Heading for run/sprint (fixes "face North").
-// - Postfix on SmoothTransition: reinforce heading for on-foot, non-aiming peds.
-// - Per-tick safety net: apply SET_PED_DESIRED_HEADING for remote on-foot, non-aiming peds.
+// What this does:
+// - Harmony Prefix completely overrides SyncedPed.WalkTo and passes the server-sent Heading to sprint/run tasks.
+// - Immediately forces facing via ped.Heading = Heading after WalkTo.
+// - Postfix on SmoothTransition also forces facing with ped.Heading = Heading.
+// - Per-tick safety net applies ped.Heading = Heading for all remote, on-foot, non-aiming peds.
 //
 // Notes:
-// - Avoids Ped.ReadPosition, TaskType, and IsTaskActive (not available to resource scripts).
-// - No patching of generic Function.Call<T> (avoids MonoMod NotSupported).
-// - C# 7.3 compatible.
+// - No generic Function.Call<T> patches (avoids MonoMod NotSupported).
+// - No use of Ped.ReadPosition, TaskType, or IsTaskActive (not available to resource).
+// - If you see stutter, you can comment out the ped.Heading assignments and try SET_ENTITY_HEADING via native,
+//   but direct property assignment is the most authoritative.
 
 using System;
 using System.Collections;
@@ -60,7 +61,7 @@ namespace RageCoop.Resources.SyncFix
                 _tSyncedPed = clientAsm.GetType("RageCoop.Client.SyncedPed", true);
                 _tEntityPool = clientAsm.GetType("RageCoop.Client.EntityPool", true);
 
-                // Bind members we'll need
+                // Bind members
                 PI_IsLocal         = _tSyncedPed.GetProperty("IsLocal",         BindingFlags.Public | BindingFlags.Instance);
                 PI_Speed           = _tSyncedPed.GetProperty("Speed",           BindingFlags.Public | BindingFlags.Instance);
                 PI_Heading         = _tSyncedPed.GetProperty("Heading",         BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
@@ -80,7 +81,7 @@ namespace RageCoop.Resources.SyncFix
                     return;
                 }
 
-                _harmony = new Harmony("ragecoop.syncfix.walkto.override");
+                _harmony = new Harmony("ragecoop.syncfix.walkto.forceheading");
 
                 // Override WalkTo entirely (instance, no args). Prefix returns false to skip original.
                 var miWalkTo = FindInstanceMethodNoArgs(_tSyncedPed, "WalkTo");
@@ -103,9 +104,9 @@ namespace RageCoop.Resources.SyncFix
                 }
 
                 // Per-tick safety net
-                API.Events.OnTick += OnTickEnforceHeading;
+                API.Events.OnTick += OnTickForceHeading;
 
-                Logger?.Info("[SyncFix] Installed WalkTo override + heading reinforcement (no ReadPosition/TaskType usage).");
+                Logger?.Info("[SyncFix] Installed WalkTo override + hard heading enforcement.");
             }
             catch (Exception ex)
             {
@@ -115,13 +116,13 @@ namespace RageCoop.Resources.SyncFix
 
         public override void OnStop()
         {
-            try { API.Events.OnTick -= OnTickEnforceHeading; } catch (Exception ex) { Logger?.Warning("[SyncFix] Failed to detach tick handler: " + ex); }
+            try { API.Events.OnTick -= OnTickForceHeading; } catch (Exception ex) { Logger?.Warning("[SyncFix] Failed to detach tick handler: " + ex); }
 
             try
             {
                 if (_harmony != null)
                 {
-                    _harmony.UnpatchAll("ragecoop.syncfix.walkto.override");
+                    _harmony.UnpatchAll("ragecoop.syncfix.walkto.forceheading");
                 }
             }
             catch (Exception ex)
@@ -130,8 +131,8 @@ namespace RageCoop.Resources.SyncFix
             }
         }
 
-        // Per-tick safety: enforce desired heading for remote, on-foot, non-aiming peds
-        private void OnTickEnforceHeading()
+        // Per-tick: hard-set heading for remote, on-foot, non-aiming peds
+        private void OnTickForceHeading()
         {
             try
             {
@@ -171,7 +172,8 @@ namespace RageCoop.Resources.SyncFix
                     if (!(headingObj is float)) continue;
                     var heading = (float)headingObj;
 
-                    Function.Call(Hash.SET_PED_DESIRED_HEADING, ped.Handle, heading);
+                    // Hard enforcement: directly set entity heading each tick
+                    ped.Heading = heading;
                 }
             }
             catch { }
@@ -191,9 +193,8 @@ namespace RageCoop.Resources.SyncFix
         {
             try
             {
-                // Read required state via reflection
                 var ped = Main.PI_MainPed.GetValue(__instance, null) as Ped;
-                if (ped == null || !ped.Exists()) return true; // fall back to original if something's off
+                if (ped == null || !ped.Exists()) return true; // fallback
 
                 // Clear tasks as original does
                 ped.Task.ClearAll();
@@ -236,16 +237,16 @@ namespace RageCoop.Resources.SyncFix
 
                 Vector3 predictPosition = predict + vel;
 
-                // Distance squared between predicted and current (use Ped.Position, not ReadPosition)
+                // Use Ped.Position for range calc
                 Vector3 cur = ped.Position;
                 float dx = predictPosition.X - cur.X;
                 float dy = predictPosition.Y - cur.Y;
                 float dz = predictPosition.Z - cur.Z;
                 float range = dx * dx + dy * dy + dz * dz;
 
-                // Read speed and heading
+                // Speed & Heading
                 var speedObj = Main.PI_Speed.GetValue(__instance, null);
-                if (!(speedObj is byte)) return true; // fallback
+                if (!(speedObj is byte)) return true;
                 byte speed = (byte)speedObj;
 
                 var headingObj = Main.PI_Heading.GetValue(__instance, null);
@@ -263,7 +264,6 @@ namespace RageCoop.Resources.SyncFix
                     catch { }
                 }
 
-                // Recreate original behavior but fix heading for run/sprint
                 switch (speed)
                 {
                     case 1:
@@ -282,48 +282,38 @@ namespace RageCoop.Resources.SyncFix
                         {
                             ped.Task.RunTo(predictPosition, true);
                             Function.Call(Hash.SET_PED_DESIRED_MOVE_BLEND_RATIO, ped.Handle, 1.0f);
-
-                            // Reinforce facing while running (not aiming)
-                            if (!isAiming)
-                            {
-                                Function.Call(Hash.SET_PED_DESIRED_HEADING, ped.Handle, heading);
-                            }
                         }
+                        // Hard enforce facing (not aiming)
+                        if (!isAiming) ped.Heading = heading;
                         break;
 
                     case 3:
                         if (!ped.IsSprinting || range > 0.75f)
                         {
-                            // IMPORTANT: pass server-sent heading here (fixes North lock)
+                            // Pass server heading here
                             Function.Call(Hash.TASK_GO_STRAIGHT_TO_COORD, ped.Handle,
                                 predictPosition.X, predictPosition.Y, predictPosition.Z,
                                 3.0f, -1, heading, 0.0f);
 
                             Function.Call(Hash.SET_RUN_SPRINT_MULTIPLIER_FOR_PLAYER, ped.Handle, 1.49f);
                             Function.Call(Hash.SET_PED_DESIRED_MOVE_BLEND_RATIO, ped.Handle, 1.0f);
-
-                            if (!isAiming)
-                            {
-                                Function.Call(Hash.SET_PED_DESIRED_HEADING, ped.Handle, heading);
-                            }
                         }
+                        // Hard enforce facing (not aiming)
+                        if (!isAiming) ped.Heading = heading;
                         break;
 
                     default:
-                        // Minimal idle handling without TaskType
                         ped.Task.StandStill(200);
                         break;
                 }
 
-                // Call SmoothTransition like the original did, to keep positional smoothing
+                // Keep original smoothing
                 try { Main.MI_SmoothTransition.Invoke(__instance, null); } catch { }
 
-                // Skip original WalkTo
-                return false;
+                return false; // skip original
             }
             catch
             {
-                // In case anything fails, let the original run
                 return true;
             }
         }
@@ -374,7 +364,8 @@ namespace RageCoop.Resources.SyncFix
                 if (!(headingObj is float)) return;
                 var heading = (float)headingObj;
 
-                Function.Call(Hash.SET_PED_DESIRED_HEADING, ped.Handle, heading);
+                // Hard enforce facing after smoothing
+                ped.Heading = heading;
             }
             catch { }
         }
