@@ -2,17 +2,17 @@
 // Fix: remote peds face their travel direction while walking/running (C# 7.3 compatible).
 //
 // Strategy:
-// - Harmony Transpiler on SyncedPed.WalkTo to replace the literal 0.0f targetHeading passed to
-//   TASK_GO_STRAIGHT_TO_COORD with the instance's Heading (server-sent).
-//   We detect the two consecutive float InputArgument(0.0f) constructions at the tail of the call
-//   (targetHeading, distanceToSlide) and rewrite the first one to use get_Heading.
-// - Postfix on SmoothTransition to reinforce desired heading during on-foot movement.
-// - Per-tick safety net to apply SET_PED_DESIRED_HEADING for non-aiming, on-foot peds.
+// - Robust Harmony Transpiler on SyncedPed.WalkTo that rewrites the InputArgument[] element at index 6
+//   (targetHeading for TASK_GO_STRAIGHT_TO_COORD) to use this.Heading, regardless of how the float is loaded
+//   (ldc.r4, ldc.i4.0+conv.r4, etc.) or how the params array is built.
+// - Postfix on SmoothTransition to reinforce heading for on-foot, non-aiming peds.
+// - Per-tick safety net to apply SET_PED_DESIRED_HEADING for on-foot, non-aiming peds.
 //
 // Notes:
-// - No patching of GTA.Native.Function.Call<T>. Only a transpiler on SyncedPed.WalkTo (non-generic).
-// - C# 7.3 compatible (no modern pattern matching).
-// - Includes minimal one-time logging to confirm the transpiler made a replacement.
+// - We do NOT patch any generic methods (avoids MonoMod NotSupportedExceptions).
+// - C# 7.3 compatible.
+// - After install you should see a log "WalkTo index-6 replacements: N" (N >= 1).
+//   If N=0, please paste your log and we’ll widen the matcher again.
 
 using System;
 using System.Collections;
@@ -33,7 +33,7 @@ namespace RageCoop.Resources.SyncFix
         private Type _tSyncedPed;
         private Type _tEntityPool;
 
-        // Reflection cache used by tick safety net
+        // Reflection cache for the safety net
         private static PropertyInfo PI_IsLocal, PI_Speed, PI_Heading, PI_MainPed, PI_IsAiming;
         private static FieldInfo FI_PedsByID;
 
@@ -98,9 +98,9 @@ namespace RageCoop.Resources.SyncFix
 
                 if (Logger != null)
                 {
-                    Logger.Info("[SyncFix] Installed. WalkTo replacements: " + WalkToHeadingTranspiler.ReplacementCount);
+                    Logger.Info("[SyncFix] Installed. WalkTo index-6 replacements: " + WalkToHeadingTranspiler.ReplacementCount);
                     if (WalkToHeadingTranspiler.ReplacementCount == 0)
-                        Logger.Warning("[SyncFix] No heading literal was replaced in WalkTo. If sprint still faces North, the IL pattern may differ. Tell me and I will tailor the matcher.");
+                        Logger.Warning("[SyncFix] No index-6 heading element was replaced in WalkTo. Share this log and we’ll tailor the matcher.");
                 }
             }
             catch (Exception ex)
@@ -111,10 +111,7 @@ namespace RageCoop.Resources.SyncFix
 
         public override void OnStop()
         {
-            try
-            {
-                API.Events.OnTick -= OnTickEnforceHeading;
-            }
+            try { API.Events.OnTick -= OnTickEnforceHeading; }
             catch (Exception ex)
             {
                 if (Logger != null) Logger.Warning("[SyncFix] Failed to detach tick handler: " + ex);
@@ -177,10 +174,7 @@ namespace RageCoop.Resources.SyncFix
                     Function.Call(Hash.SET_PED_DESIRED_HEADING, ped.Handle, heading);
                 }
             }
-            catch
-            {
-                // ignore per frame
-            }
+            catch { }
         }
 
         private static MethodInfo FindInstanceMethodNoArgs(Type t, string name)
@@ -190,87 +184,114 @@ namespace RageCoop.Resources.SyncFix
         }
     }
 
-    // Transpiler: find the pair of InputArgument(float 0.0) used at the end of TASK_GO_STRAIGHT_TO_COORD
-    // and replace the first (targetHeading) with `this.get_Heading()`.
+    // Robust Transpiler:
+    // We scan the array initialization sequence for InputArgument[] in WalkTo and look for
+    //   dup; ldc.i4.s 6; ... ; newobj InputArgument::.ctor(float32); stelem.ref
+    // When we detect index==6, we replace the value-producing sequence just before newobj
+    // with: ldarg.0 ; callvirt instance float32 get_Heading()
     public static class WalkToHeadingTranspiler
     {
         public static int ReplacementCount = 0;
 
-        public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions, ILGenerator il)
+        public static IEnumerable<CodeInstruction> Transpiler(MethodBase original, IEnumerable<CodeInstruction> instructions, ILGenerator il)
         {
-            var list = new List<CodeInstruction>(instructions);
-
-            // InputArgument .ctor(float)
+            var codes = new List<CodeInstruction>(instructions);
             var ctorFloat = typeof(InputArgument).GetConstructor(new Type[] { typeof(float) });
-            // SyncedPed.get_Heading
-            // We don't have the type here, use the declaring type from the current method via try-catch.
+
+            // Resolve get_Heading on the declaring type of WalkTo
             MethodInfo getHeading = null;
-
-            // We’ll derive the declaring type from the target method if possible by scanning for callvirt to get_Heading later if needed.
-            // Safer: assume property name "get_Heading" exists on the declaring type.
-            // We'll fetch once we see a pattern and need it.
-
-            for (int i = 0; i < list.Count - 3; i++)
+            var declType = original.DeclaringType;
+            if (declType != null)
             {
-                // Look for: ldc.r4 0.0 ; newobj InputArgument(float)
-                // followed immediately by: ldc.r4 0.0 ; newobj InputArgument(float)
-                if (list[i].opcode == OpCodes.Ldc_R4 && IsZero(list[i].operand) &&
-                    list[i + 1].opcode == OpCodes.Newobj && (ConstructorInfo)list[i + 1].operand == ctorFloat &&
-                    list[i + 2].opcode == OpCodes.Ldc_R4 && IsZero(list[i + 2].operand) &&
-                    list[i + 3].opcode == OpCodes.Newobj && (ConstructorInfo)list[i + 3].operand == ctorFloat)
+                var prop = declType.GetProperty("Heading", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (prop != null) getHeading = prop.GetGetMethod(true);
+            }
+
+            if (getHeading == null || ctorFloat == null)
+            {
+                // Nothing we can do
+                return codes;
+            }
+
+            for (int i = 0; i < codes.Count - 5; i++)
+            {
+                // Pattern: dup ; ldc.i4.* 6 ; <any number of instructions that push a float> ; newobj InputArgument(float) ; stelem.ref
+                if (codes[i].opcode == OpCodes.Dup &&
+                    IsLoadConstI4WithValue(codes[i + 1], 6))
                 {
-                    // Replace the first zero with `ldarg.0 ; callvirt instance float32 get_Heading()`
-                    // Ensure we can resolve get_Heading from the method's declaring type
-                    var declaringType = GetDeclaringTypeSafely(list);
-                    if (declaringType != null && getHeading == null)
+                    // Find the next 'newobj InputArgument(float)'
+                    int j = i + 2;
+                    int newObjIndex = -1;
+                    for (; j < Math.Min(i + 25, codes.Count); j++)
                     {
-                        var prop = declaringType.GetProperty("Heading", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                        if (prop != null) getHeading = prop.GetGetMethod(true);
+                        if (codes[j].opcode == OpCodes.Newobj && codes[j].operand is ConstructorInfo && (ConstructorInfo)codes[j].operand == ctorFloat)
+                        {
+                            newObjIndex = j;
+                            break;
+                        }
+                    }
+                    if (newObjIndex == -1) continue;
+
+                    // We expect stelem.ref right after
+                    int k = newObjIndex + 1;
+                    if (k >= codes.Count) continue;
+                    bool hasStelem = (codes[k].opcode == OpCodes.Stelem_Ref || codes[k].opcode == OpCodes.Stelem);
+                    if (!hasStelem) continue;
+
+                    // Replace whatever value-producing sequence exists between (i+2 .. newObjIndex-1)
+                    // with: ldarg.0 ; callvirt get_Heading
+                    // Implementation: remove those slots and inject our two instructions at i+2
+                    // Ensure we don't break label/branch targets: insert first, then NOP the old value-producing range.
+
+                    // Insert ldarg.0; callvirt get_Heading before newobj
+                    codes.Insert(newObjIndex, new CodeInstruction(OpCodes.Callvirt, getHeading));
+                    codes.Insert(newObjIndex, new CodeInstruction(OpCodes.Ldarg_0));
+
+                    // NOP previous value-producing segment
+                    for (int p = i + 2; p < newObjIndex; p++)
+                    {
+                        // Only clear simple constants and math; avoid wrecking labels
+                        if (codes[p].labels != null && codes[p].labels.Count > 0) continue;
+                        if (codes[p].opcode.FlowControl == FlowControl.Next)
+                        {
+                            codes[p].opcode = OpCodes.Nop;
+                            codes[p].operand = null;
+                        }
                     }
 
-                    if (getHeading != null)
-                    {
-                        // Overwrite the 0.0 with ldarg.0 and insert callvirt get_Heading before the newobj
-                        list[i] = new CodeInstruction(OpCodes.Ldarg_0);
-                        list.Insert(i + 1, new CodeInstruction(OpCodes.Callvirt, getHeading));
-                        ReplacementCount++;
-                        // Skip past the inserted callvirt and the first newobj
-                        i += 2;
-                    }
+                    ReplacementCount++;
+                    // Advance past the edited segment
+                    i = newObjIndex + 1;
                 }
             }
 
-            return list;
+            return codes;
         }
 
-        private static bool IsZero(object operand)
+        private static bool IsLoadConstI4WithValue(CodeInstruction ci, int value)
         {
-            try
+            if (ci.opcode == OpCodes.Ldc_I4 && ci.operand is int && (int)ci.operand == value) return true;
+            if (value == 6 && (ci.opcode == OpCodes.Ldc_I4_6)) return true;
+            if (value >= -1 && value <= 8)
             {
-                if (operand is float) return (float)operand == 0f;
-                if (operand is double) return (double)operand == 0.0;
+                // Handle short forms
+                switch (value)
+                {
+                    case -1: return ci.opcode == OpCodes.Ldc_I4_M1;
+                    case 0: return ci.opcode == OpCodes.Ldc_I4_0;
+                    case 1: return ci.opcode == OpCodes.Ldc_I4_1;
+                    case 2: return ci.opcode == OpCodes.Ldc_I4_2;
+                    case 3: return ci.opcode == OpCodes.Ldc_I4_3;
+                    case 4: return ci.opcode == OpCodes.Ldc_I4_4;
+                    case 5: return ci.opcode == OpCodes.Ldc_I4_5;
+                    case 6: return ci.opcode == OpCodes.Ldc_I4_6;
+                    case 7: return ci.opcode == OpCodes.Ldc_I4_7;
+                    case 8: return ci.opcode == OpCodes.Ldc_I4_8;
+                }
             }
-            catch { }
+            // Also handle ldc.i4.s
+            if (ci.opcode == OpCodes.Ldc_I4_S && ci.operand is sbyte && (sbyte)ci.operand == (sbyte)value) return true;
             return false;
-        }
-
-        // Attempt to derive the declaring type from the IL stream by finding any callvirt on a method of an instance type.
-        private static Type GetDeclaringTypeSafely(List<CodeInstruction> list)
-        {
-            for (int k = 0; k < list.Count; k++)
-            {
-                var ci = list[k];
-                if ((ci.opcode == OpCodes.Call || ci.opcode == OpCodes.Callvirt) && ci.operand is MethodInfo)
-                {
-                    var mi = (MethodInfo)ci.operand;
-                    if (mi.DeclaringType != null && !mi.IsStatic)
-                    {
-                        return mi.DeclaringType;
-                    }
-                }
-            }
-            // Fallback: cannot infer
-            return null;
         }
     }
 
