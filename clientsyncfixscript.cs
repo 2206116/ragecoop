@@ -1,26 +1,25 @@
 // Build this as a client resource DLL and include Harmony (HarmonyLib) in the resource package.
 // Fix: remote peds face their travel direction while walking/running (C# 7.3 compatible).
 //
-// Strategy (safe for this runtime; no generic method patching):
-// 1) Patch SyncedPed.WalkTo:
-//    - Prefix: mark we're in WalkTo and stash the current desired Heading (thread-static).
-//    - Postfix: reinforce desired heading after WalkTo runs.
-// 2) Patch ONLY GTA.Native.Function.Call(Hash, InputArgument[]) (non-generic):
-//    - Prefix: if inside WalkTo and hash == TASK_GO_STRAIGHT_TO_COORD, replace targetHeading (argument index 6)
-//      with the stashed Heading so the ped doesn't lock to North.
-// 3) Patch SyncedPed.SmoothTransition (Postfix) to keep desired heading aligned while on-foot.
-// 4) Per-tick safety net applies SET_PED_DESIRED_HEADING to all remote on-foot peds that are not aiming.
+// Strategy (no generic method patching; safe with this runtime):
+// 1) Patch SyncedPed.WalkTo (Postfix) and immediately re-issue TASK_GO_STRAIGHT_TO_COORD
+//    with the correct targetHeading (server-sent Heading) for Speed==2 (run) and Speed==3 (sprint).
+//    We reconstruct the original predictPosition using SyncedPed.Predict(Position) + Velocity by reflection.
+//    This overrides the original call that used targetHeading=0 (North).
+// 2) Patch SyncedPed.SmoothTransition (Postfix) to reinforce desired heading during on-foot motion.
+// 3) Add a per-tick safety net to apply SET_PED_DESIRED_HEADING for all remote on-foot, non-aiming peds.
 //
 // Notes:
-// - Do NOT patch the generic Function.Call<T> overload; it triggers a NotSupportedException in this runtime.
-// - C# 7.3 compatible (no newer pattern features).
-// - Logger.Warning overloads take a single string.
+// - Avoids patching GTA.Native.Function.Call<T> or any generic methods (which throw NotSupported in this environment).
+// - C# 7.3 compatible: no modern pattern features.
+// - Keep your server-side hysteresis/heading-from-motion changes; this script complements them.
 
 using System;
 using System.Collections;
 using System.Linq;
 using System.Reflection;
 using GTA;
+using GTA.Math;
 using GTA.Native;
 using HarmonyLib;
 using RageCoop.Client.Scripting;
@@ -51,14 +50,18 @@ namespace RageCoop.Resources.SyncFix
                 _tEntityPool = clientAsm.GetType("RageCoop.Client.EntityPool", true);
 
                 // Cache members via reflection
-                State.PI_IsLocal  = _tSyncedPed.GetProperty("IsLocal",  BindingFlags.Public | BindingFlags.Instance);
-                State.PI_Speed    = _tSyncedPed.GetProperty("Speed",    BindingFlags.Public | BindingFlags.Instance);
-                State.PI_Heading  = _tSyncedPed.GetProperty("Heading",  BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                State.PI_MainPed  = _tSyncedPed.GetProperty("MainPed",  BindingFlags.Public | BindingFlags.Instance);
-                State.PI_IsAiming = _tSyncedPed.GetProperty("IsAiming", BindingFlags.NonPublic | BindingFlags.Instance);
-                State.FI_PedsByID = _tEntityPool.GetField("PedsByID", BindingFlags.Public | BindingFlags.Static);
+                State.PI_IsLocal   = _tSyncedPed.GetProperty("IsLocal",   BindingFlags.Public | BindingFlags.Instance);
+                State.PI_Speed     = _tSyncedPed.GetProperty("Speed",     BindingFlags.Public | BindingFlags.Instance);
+                State.PI_Heading   = _tSyncedPed.GetProperty("Heading",   BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                State.PI_MainPed   = _tSyncedPed.GetProperty("MainPed",   BindingFlags.Public | BindingFlags.Instance);
+                State.PI_IsAiming  = _tSyncedPed.GetProperty("IsAiming",  BindingFlags.NonPublic | BindingFlags.Instance);
+                State.PI_Position  = _tSyncedPed.GetProperty("Position",  BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                State.PI_Velocity  = _tSyncedPed.GetProperty("Velocity",  BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                State.MI_Predict   = _tSyncedPed.GetMethod("Predict", BindingFlags.NonPublic | BindingFlags.Instance, null, new Type[] { typeof(Vector3) }, null);
+                State.FI_PedsByID  = _tEntityPool.GetField("PedsByID", BindingFlags.Public | BindingFlags.Static);
 
-                if (State.PI_IsLocal == null || State.PI_Speed == null || State.PI_Heading == null || State.PI_MainPed == null || State.FI_PedsByID == null)
+                if (State.PI_IsLocal == null || State.PI_Speed == null || State.PI_Heading == null || State.PI_MainPed == null ||
+                    State.PI_Position == null || State.PI_Velocity == null || State.FI_PedsByID == null)
                 {
                     if (Logger != null) Logger.Error("[SyncFix] Failed to bind SyncedPed/EntityPool members. Aborting.");
                     return;
@@ -66,29 +69,16 @@ namespace RageCoop.Resources.SyncFix
 
                 _harmony = new Harmony("ragecoop.syncfix.heading");
 
-                // Patch SyncedPed.WalkTo (instance, no args): Prefix for scope + Postfix reinforcement
+                // Patch SyncedPed.WalkTo (instance, no args): Postfix override with correct heading
                 var miWalkTo = FindInstanceMethodNoArgs(_tSyncedPed, "WalkTo");
                 if (miWalkTo != null)
                 {
                     _harmony.Patch(miWalkTo,
-                        prefix:  new HarmonyMethod(typeof(WalkToScopePatch).GetMethod("Prefix",  BindingFlags.Public | BindingFlags.Static)),
                         postfix: new HarmonyMethod(typeof(SyncedPedPatches).GetMethod("WalkTo_Postfix", BindingFlags.Public | BindingFlags.Static)));
                 }
                 else
                 {
                     if (Logger != null) Logger.Warning("[SyncFix] Could not locate SyncedPed.WalkTo; relying on SmoothTransition and tick safety net.");
-                }
-
-                // Patch ONLY the non-generic Function.Call(Hash, InputArgument[]) to override targetHeading
-                var miCallVoid = FindFunctionCallVoid();
-                if (miCallVoid != null)
-                {
-                    _harmony.Patch(miCallVoid,
-                        prefix: new HarmonyMethod(typeof(FunctionCallPatch).GetMethod("CallVoid_Prefix", BindingFlags.Public | BindingFlags.Static)));
-                }
-                else
-                {
-                    if (Logger != null) Logger.Warning("[SyncFix] Could not patch GTA.Native.Function.Call(void).");
                 }
 
                 // Patch SyncedPed.SmoothTransition Postfix
@@ -106,7 +96,7 @@ namespace RageCoop.Resources.SyncFix
                 // Safety net: per-tick enforcement
                 API.Events.OnTick += OnTickEnforceHeading;
 
-                if (Logger != null) Logger.Info("[SyncFix] Client-side heading override installed (void overload patch only).");
+                if (Logger != null) Logger.Info("[SyncFix] Client-side heading override installed (post-move override).");
             }
             catch (Exception ex)
             {
@@ -188,31 +178,14 @@ namespace RageCoop.Resources.SyncFix
             }
         }
 
-        // Helpers: find methods safely (avoid AmbiguousMatchException)
+        // Helpers: find instance methods safely
         private static MethodInfo FindInstanceMethodNoArgs(Type t, string name)
         {
             return t.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
                     .FirstOrDefault(m => m.Name == name && m.GetParameters().Length == 0);
         }
 
-        private static MethodInfo FindFunctionCallVoid()
-        {
-            var methods = typeof(Function).GetMethods(BindingFlags.Public | BindingFlags.Static);
-            foreach (var m in methods)
-            {
-                if (m.Name != "Call") continue;
-                if (m.IsGenericMethodDefinition) continue;
-                var ps = m.GetParameters();
-                if (ps.Length != 2) continue;
-                if (ps[0].ParameterType != typeof(Hash)) continue;
-                if (ps[1].ParameterType != typeof(InputArgument[])) continue;
-                if (m.ReturnType != typeof(void)) continue;
-                return m;
-            }
-            return null;
-        }
-
-        // Shared reflection info + thread-static scope
+        // Shared reflection info
         internal static class State
         {
             public static PropertyInfo PI_IsLocal;
@@ -220,80 +193,33 @@ namespace RageCoop.Resources.SyncFix
             public static PropertyInfo PI_Heading;
             public static PropertyInfo PI_MainPed;
             public static PropertyInfo PI_IsAiming;
+            public static PropertyInfo PI_Position;
+            public static PropertyInfo PI_Velocity;
+            public static MethodInfo   MI_Predict;
             public static FieldInfo    FI_PedsByID;
-
-            [ThreadStatic] public static bool  TLS_InWalkTo;
-            [ThreadStatic] public static float TLS_DesiredHeading;
-        }
-
-        // Mark the WalkTo scope and stash desired heading for Function.Call patch
-        public static class WalkToScopePatch
-        {
-            public static void Prefix(object __instance)
-            {
-                try
-                {
-                    var headingObj = State.PI_Heading != null ? State.PI_Heading.GetValue(__instance, null) : null;
-                    if (headingObj is float)
-                    {
-                        State.TLS_DesiredHeading = (float)headingObj;
-                        State.TLS_InWalkTo = true;
-                    }
-                    else
-                    {
-                        State.TLS_InWalkTo = false;
-                    }
-                }
-                catch
-                {
-                    State.TLS_InWalkTo = false;
-                }
-            }
         }
     }
 
-    // Patch GTA.Native.Function.Call(void) to override TASK_GO_STRAIGHT_TO_COORD's targetHeading during WalkTo
-    public static class FunctionCallPatch
-    {
-        public static void CallVoid_Prefix(Hash hash, InputArgument[] arguments)
-        {
-            try
-            {
-                if (!Main.State.TLS_InWalkTo) return;
-                if (hash != Hash.TASK_GO_STRAIGHT_TO_COORD) return;
-                if (arguments == null || arguments.Length < 8) return;
-
-                // TASK_GO_STRAIGHT_TO_COORD(ped, x, y, z, speed, timeout, targetHeading, distanceToSlide)
-                arguments[6] = new InputArgument(Main.State.TLS_DesiredHeading);
-            }
-            catch
-            {
-                // No-op on failure
-            }
-            finally
-            {
-                // Ensure scope flag resets for this call to avoid leaking into other invocations during the same tick
-                Main.State.TLS_InWalkTo = false;
-            }
-        }
-    }
-
-    // Reinforcement patches on SyncedPed methods (public for Harmony)
+    // Reinforcement + override patches on SyncedPed methods (public for Harmony)
     public static class SyncedPedPatches
     {
-        private static PropertyInfo PI_Speed, PI_Heading, PI_MainPed, PI_IsAiming;
+        private static PropertyInfo PI_Speed, PI_Heading, PI_MainPed, PI_IsAiming, PI_Position, PI_Velocity;
+        private static MethodInfo MI_Predict;
 
         private static void EnsureBind(object instance)
         {
             if (PI_Speed != null) return;
             var tSyncedPed = instance.GetType();
-            PI_Speed    = tSyncedPed.GetProperty("Speed",    BindingFlags.Public | BindingFlags.Instance);
-            PI_Heading  = tSyncedPed.GetProperty("Heading",  BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-            PI_MainPed  = tSyncedPed.GetProperty("MainPed",  BindingFlags.Public | BindingFlags.Instance);
-            PI_IsAiming = tSyncedPed.GetProperty("IsAiming", BindingFlags.NonPublic | BindingFlags.Instance);
+            PI_Speed     = tSyncedPed.GetProperty("Speed",     BindingFlags.Public | BindingFlags.Instance);
+            PI_Heading   = tSyncedPed.GetProperty("Heading",   BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            PI_MainPed   = tSyncedPed.GetProperty("MainPed",   BindingFlags.Public | BindingFlags.Instance);
+            PI_IsAiming  = tSyncedPed.GetProperty("IsAiming",  BindingFlags.NonPublic | BindingFlags.Instance);
+            PI_Position  = tSyncedPed.GetProperty("Position",  BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            PI_Velocity  = tSyncedPed.GetProperty("Velocity",  BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            MI_Predict   = tSyncedPed.GetMethod("Predict", BindingFlags.NonPublic | BindingFlags.Instance, null, new Type[] { typeof(Vector3) }, null);
         }
 
-        // After WalkTo completes, reinforce desired heading so AI nav doesn't fight us
+        // After WalkTo issues movement tasks, immediately re-issue GoStraight with correct heading for run/sprint
         public static void WalkTo_Postfix(object __instance)
         {
             try
@@ -303,7 +229,9 @@ namespace RageCoop.Resources.SyncFix
                 var speedObj = PI_Speed != null ? PI_Speed.GetValue(__instance, null) : null;
                 if (!(speedObj is byte)) return;
                 var speed = (byte)speedObj;
-                if (speed == 0 || speed >= 4) return; // on-foot only
+
+                // Only on-foot run/sprint
+                if (speed != 2 && speed != 3) return;
 
                 var ped = PI_MainPed != null ? PI_MainPed.GetValue(__instance, null) as Ped : null;
                 if (ped == null || !ped.Exists()) return;
@@ -324,9 +252,42 @@ namespace RageCoop.Resources.SyncFix
                 if (!(headingObj is float)) return;
                 var heading = (float)headingObj;
 
+                // Reconstruct predictPosition = Predict(Position) + Velocity
+                Vector3 pos = default(Vector3);
+                Vector3 vel = default(Vector3);
+                try
+                {
+                    var posObj = PI_Position != null ? PI_Position.GetValue(__instance, null) : null;
+                    if (posObj is Vector3) pos = (Vector3)posObj;
+                }
+                catch { }
+                try
+                {
+                    var velObj = PI_Velocity != null ? PI_Velocity.GetValue(__instance, null) : null;
+                    if (velObj is Vector3) vel = (Vector3)velObj;
+                }
+                catch { }
+
+                Vector3 predict = pos;
+                try
+                {
+                    if (MI_Predict != null) predict = (Vector3)MI_Predict.Invoke(__instance, new object[] { pos });
+                }
+                catch { }
+
+                Vector3 target = predict + vel;
+
+                // Re-issue GoStraight with correct heading. Use speed: 3.0 for sprint, 2.0 for run.
+                float moveSpeed = (speed == 3) ? 3.0f : 2.0f;
+                Function.Call(Hash.TASK_GO_STRAIGHT_TO_COORD, ped.Handle, target.X, target.Y, target.Z, moveSpeed, -1, heading, 0.0f);
+
+                // Also set desired heading as a nudge
                 Function.Call(Hash.SET_PED_DESIRED_HEADING, ped.Handle, heading);
             }
-            catch { }
+            catch
+            {
+                // Swallow to avoid destabilizing the client script
+            }
         }
 
         // After SmoothTransition, reinforce desired heading for on-foot, non-aiming peds
